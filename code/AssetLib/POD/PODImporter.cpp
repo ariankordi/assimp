@@ -39,6 +39,21 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ----------------------------------------------------------------------
 */
 
+#include "PVRAssets/model/Animation.h"
+#include "PVRCore/types/Types.h"
+#include "assimp/Exceptional.h"
+#include "assimp/anim.h"
+#include "assimp/matrix4x4.h"
+#include "assimp/mesh.h"
+#include "assimp/quaternion.h"
+#include "assimp/types.h"
+#include "assimp/vector3.h"
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <string>
+#include <vector>
 #ifndef ASSIMP_BUILD_NO_POD_IMPORTER
 
 #include "PODImporter.h"
@@ -88,10 +103,13 @@ bool PODImporter::CanRead(const std::string &pFile, IOSystem *pIOHandler, bool c
     return SearchFileHeaderForToken(pIOHandler, pFile, tokens, AI_COUNT_OF(tokens));
 }
 
+namespace
+{
+
 // Generic vertex component decoder, ported from PVRAssets' Helper::VertexRead
 // (PVRAssets/Helper.cpp) so we don't have to link the rest of Helper.cpp, which
 // pulls in the (unused, for POD) GltfReader/tinygltf dependency.
-static void ReadVertexComponent(const uint8_t *data, pvr::DataType type, uint32_t count, float *out) {
+void ReadVertexComponent(const uint8_t *data, pvr::DataType type, uint32_t count, float *out) {
     out[0] = 0;
     if (count > 1) out[1] = 0;
     if (count > 2) out[2] = 0;
@@ -136,7 +154,7 @@ static void ReadVertexComponent(const uint8_t *data, pvr::DataType type, uint32_
     }
 }
 
-static uint32_t ReadFaceIndex(const uint8_t *data, IndexType type, uint32_t i) {
+uint32_t ReadFaceIndex(const uint8_t *data, IndexType type, uint32_t i) {
     if (type == IndexType::IndexType32Bit) {
         return reinterpret_cast<const uint32_t *>(data)[i];
     }
@@ -147,17 +165,17 @@ static uint32_t ReadFaceIndex(const uint8_t *data, IndexType type, uint32_t i) {
 // parsing both static node rotations and animation keyframes (it does
 // this unconditionally, regardless of the authoring SDK version). That
 // negation reverses rotation direction and, empirically, produces a
-// skeleton reflected top-to-bottom for this Miitomo file (authored with
-// SDK 3.5): composing the raw node hierarchy with PVRAssets' own
+// skeleton reflected top-to-bottom for a file authored with
+// SDK 3.5: composing the raw node hierarchy with PVRAssets' own
 // getWorldMatrix()/constructSRT() puts e.g. Spine_2 *below* Waist
 // instead of above it. Negating w back here undoes PODReader's
 // negation and reproduces the expected bind pose.
-static aiQuaternion ToAiQuaternion(const glm::quat &q) {
-    return aiQuaternion(-q.w, q.x, q.y, q.z);
+aiQuaternion ToAiQuaternion(const glm::quat &q) {
+    return {-q.w, q.x, q.y, q.z};
 }
 
-static aiVector3D ToAiVector3D(const glm::vec3 &v) {
-    return aiVector3D(v.x, v.y, v.z);
+aiVector3D ToAiVector3D(const glm::vec3 &v) {
+    return {v.x, v.y, v.z};
 }
 
 // Composes a node's bind-pose world transform by walking its aiNode
@@ -168,7 +186,7 @@ static aiVector3D ToAiVector3D(const glm::vec3 &v) {
 // quaternion convention -- mixing them with our corrected node
 // hierarchy would make bone world transform and inverse bind matrix
 // mutually inconsistent, distorting the mesh even in bind pose.
-static aiMatrix4x4 ComputeWorldTransform(const aiNode *node) {
+aiMatrix4x4 ComputeWorldTransform(const aiNode *node) {
     aiMatrix4x4 world = node->mTransformation;
     for (const aiNode *parent = node->mParent; parent != nullptr; parent = parent->mParent) {
         world = parent->mTransformation * world;
@@ -176,13 +194,15 @@ static aiMatrix4x4 ComputeWorldTransform(const aiNode *node) {
     return world;
 }
 
-static unsigned int CountDescendants(const aiNode *n) {
+unsigned int CountDescendants(const aiNode *n) {
     unsigned int count = n->mNumChildren;
     for (unsigned int i = 0; i < n->mNumChildren; ++i) {
         count += CountDescendants(n->mChildren[i]);
     }
     return count;
 }
+
+} // namespace
 
 void PODImporter::BuildNodes(Model &model, aiScene *pScene) {
     const uint32_t numNodes = model.getNumNodes();
@@ -270,9 +290,7 @@ void PODImporter::BuildNodes(Model &model, aiScene *pScene) {
 }
 
 void PODImporter::BuildMeshesAndMaterials(Model &model, aiScene *pScene) {
-    // Materials: minimal name-only translation. POD's material data is generic
-    // and the Miitomo-specific parts (LUTs, translucency) live elsewhere; a
-    // dedicated importer/tool could layer richer material support on top later.
+    // Materials: minimal name-only translation.
     const uint32_t numMaterials = model.getNumMaterials();
     if (numMaterials > 0) {
         pScene->mNumMaterials = numMaterials;
@@ -496,7 +514,7 @@ void PODImporter::BuildAnimations(Model &model, aiScene *pScene) {
                 }
             }
             // Matrix-only channels (kf.mat4) aren't produced by SRT-animated POD
-            // exports like Miitomo's; not handled here.
+            // exports like from Miitomo; not handled here.
         }
     }
 
