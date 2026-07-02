@@ -834,6 +834,9 @@ IF ( ASSIMP_BUILD_ASSIMP_TOOLS )
   ENDIF ()
   # The command line tool
   ADD_SUBDIRECTORY( tools/assimp_cmd/ )
+  # Merges an aiAnimation from one file into another file's scene (any
+  # importer/exporter pair assimp supports, matched by node/bone name).
+  ADD_SUBDIRECTORY( tools/assimp_merge_anim/ )
 ENDIF ()
 
 IF ( ASSIMP_BUILD_SAMPLES )
