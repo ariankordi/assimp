@@ -695,6 +695,30 @@ ELSE ()
   ADD_DEFINITIONS( -DASSIMP_BUILD_NO_C4D_IMPORTER )
 ENDIF ()
 
+SET ( ASSIMP_BUILD_POD_IMPORTER OFF CACHE BOOL
+  "Build the PowerVR POD importer, which relies on the PVRAssets loader from the PowerVR Native SDK."
+)
+SET ( PVR_SDK_DIR "" CACHE PATH
+  "Path to a checkout of the PowerVR Native SDK (https://github.com/powervr-graphics/Native_SDK), required by ASSIMP_BUILD_POD_IMPORTER."
+)
+
+IF (ASSIMP_BUILD_POD_IMPORTER)
+  IF (NOT EXISTS "${PVR_SDK_DIR}/framework/PVRAssets/fileio/PODReader.cpp")
+    MESSAGE( FATAL_ERROR
+      "ASSIMP_BUILD_POD_IMPORTER requires PVR_SDK_DIR to point at a PowerVR Native SDK checkout "
+      "(expected to find framework/PVRAssets/fileio/PODReader.cpp under it)."
+    )
+  ENDIF ()
+  IF (NOT EXISTS "${PVR_SDK_DIR}/external/glm/source/glm/glm.hpp")
+    MESSAGE( FATAL_ERROR
+      "ASSIMP_BUILD_POD_IMPORTER requires the PowerVR Native SDK's glm submodule to be checked out "
+      "(run: git -C ${PVR_SDK_DIR} submodule update --init external/glm)."
+    )
+  ENDIF ()
+ELSE ()
+  ADD_DEFINITIONS( -DASSIMP_BUILD_NO_POD_IMPORTER )
+ENDIF ()
+
 IF(ASSIMP_BUILD_DRACO_STATIC)
   SET(ASSIMP_BUILD_DRACO ON)
 ENDIF()

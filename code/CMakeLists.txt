@@ -242,6 +242,29 @@ IF ( ASSIMP_BUILD_NONFREE_C4D_IMPORTER )
   SOURCE_GROUP( C4D FILES ${C4D_SRCS})
 ENDIF ()
 
+IF ( ASSIMP_BUILD_POD_IMPORTER )
+  SET( POD_SRCS
+    AssetLib/POD/PODImporter.cpp
+    AssetLib/POD/PODImporter.h
+  )
+  SOURCE_GROUP( POD FILES ${POD_SRCS})
+
+  # Minimal POD-parsing subset of the PowerVR Native SDK's PVRAssets library:
+  # PODReader plus the Model/Mesh/Animation/Camera/Light data classes it depends
+  # on. Deliberately excludes GltfReader.cpp (would require tinygltf), Helper.cpp
+  # (unused by readPOD, and pulls in GltfReader.h), pfx/PFXParser.cpp (would
+  # require pugixml), and all texture I/O -- none of that is needed to parse POD.
+  SET( POD_LOADER_SRCS
+    ${PVR_SDK_DIR}/framework/PVRAssets/fileio/PODReader.cpp
+    ${PVR_SDK_DIR}/framework/PVRAssets/model/Model.cpp
+    ${PVR_SDK_DIR}/framework/PVRAssets/model/Mesh.cpp
+    ${PVR_SDK_DIR}/framework/PVRAssets/model/Animation.cpp
+    ${PVR_SDK_DIR}/framework/PVRAssets/model/Camera.cpp
+    ${PVR_SDK_DIR}/framework/PVRAssets/model/Light.cpp
+  )
+  SOURCE_GROUP( POD\\PVRAssets FILES ${POD_LOADER_SRCS})
+ENDIF ()
+
 # if this variable is set to TRUE, the user can manually disable importers by setting
 # ASSIMP_BUILD_XXX_IMPORTER to FALSE for each importer
 # if this variable is set to FALSE, the user can manually enable importers by setting
@@ -1385,6 +1408,14 @@ IF (ASSIMP_BUILD_NONFREE_C4D_IMPORTER)
   INCLUDE_DIRECTORIES(${C4D_INCLUDES})
 ENDIF ()
 
+IF (ASSIMP_BUILD_POD_IMPORTER)
+  SET( assimp_src ${assimp_src} ${POD_SRCS} ${POD_LOADER_SRCS})
+  INCLUDE_DIRECTORIES(
+    "${PVR_SDK_DIR}/framework"
+    "${PVR_SDK_DIR}/external/glm/source"
+  )
+ENDIF ()
+
 IF (ASSIMP_BUILD_DRACO)
   INCLUDE_DIRECTORIES(${draco_INCLUDE_DIRS})
   ADD_DEFINITIONS( -DASSIMP_ENABLE_DRACO )
@@ -1392,6 +1423,12 @@ ENDIF()
 
 ADD_LIBRARY( assimp ${assimp_src} )
 ADD_LIBRARY(assimp::assimp ALIAS assimp)
+
+IF (ASSIMP_BUILD_POD_IMPORTER)
+  # Vendored third-party source (PowerVR Native SDK) -- don't hold it to this
+  # project's -Werror policy, and don't patch it to work around warnings.
+  SET_SOURCE_FILES_PROPERTIES(${POD_LOADER_SRCS} PROPERTIES COMPILE_FLAGS "-w")
+ENDIF ()
 
 # Add or remove dllexport tags depending on the library type.
 IF (BUILD_SHARED_LIBS)

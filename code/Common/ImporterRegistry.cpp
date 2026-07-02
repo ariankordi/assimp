@@ -154,6 +154,9 @@ corresponding preprocessor flag to selectively disable formats.
 #ifndef ASSIMP_BUILD_NO_OGRE_IMPORTER
 #include "AssetLib/Ogre/OgreImporter.h"
 #endif
+#ifndef ASSIMP_BUILD_NO_POD_IMPORTER
+#include "AssetLib/POD/PODImporter.h"
+#endif
 #ifndef ASSIMP_BUILD_NO_OPENGEX_IMPORTER
 #include "AssetLib/OpenGEX/OpenGEXImporter.h"
 #endif
@@ -336,6 +339,9 @@ void GetImporterInstanceList(std::vector<BaseImporter *> &out) {
 #endif
 #if (!defined ASSIMP_BUILD_NO_OGRE_IMPORTER)
     out.push_back(new Ogre::OgreImporter());
+#endif
+#if (!defined ASSIMP_BUILD_NO_POD_IMPORTER)
+    out.push_back(new PODImporter());
 #endif
 #if (!defined ASSIMP_BUILD_NO_OPENGEX_IMPORTER)
     out.push_back(new OpenGEX::OpenGEXImporter());
