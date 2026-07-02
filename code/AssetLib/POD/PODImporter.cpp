@@ -73,6 +73,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "PVRAssets/fileio/PODReader.h"
 #include "PVRCore/stream/BufferStream.h"
 
+#include <glm/gtx/matrix_decompose.hpp>
+
 using namespace pvr;
 using namespace pvr::assets;
 
@@ -176,6 +178,14 @@ aiQuaternion ToAiQuaternion(const glm::quat &q) {
 
 aiVector3D ToAiVector3D(const glm::vec3 &v) {
     return {v.x, v.y, v.z};
+}
+
+// For KeyFrameData::mat4 channels (baked per-frame 4x4 matrices), used by
+// e_nodeAnimationMatrix. Unlike the SRT rotation path, PODReader never
+// touches quaternions here -- there's nothing to undo -- so this must NOT
+// apply the -w correction ToAiQuaternion above applies for the SRT path.
+aiQuaternion RawToAiQuaternion(const glm::quat &q) {
+    return {q.w, q.x, q.y, q.z};
 }
 
 // Composes a node's bind-pose world transform by walking its aiNode
@@ -513,8 +523,32 @@ void PODImporter::BuildAnimations(Model &model, aiScene *pScene) {
                     maxTicks = std::max(maxTicks, t);
                 }
             }
-            // Matrix-only channels (kf.mat4) aren't produced by SRT-animated POD
-            // exports like from Miitomo; not handled here.
+            // e_nodeAnimationMatrix channels (Miitomo's real animation POD files
+            // use these, not separate SRT tracks -- confirmed via pod_animdump
+            // against animActionAntigravity.Anim.pod, whose translation/rotate/
+            // scale arrays are all empty while mat4 holds one baked matrix per
+            // frame). Each frame's matrix must be decomposed back into T/R/S
+            // since aiNodeAnim has no raw-matrix key type. Unlike the SRT
+            // rotation path, PODReader writes these matrices as read from disk
+            // with no quaternion sign fix-up applied anywhere, so the decomposed
+            // quaternion is used as-is via RawToAiQuaternion (not ToAiQuaternion).
+            if (!kf.mat4.empty()) {
+                for (size_t k = 0; k < kf.mat4.size(); ++k) {
+                    glm::vec3 scale;
+                    glm::quat rotation;
+                    glm::vec3 translation;
+                    glm::vec3 skew;
+                    glm::vec4 perspective;
+                    if (!glm::decompose(kf.mat4[k], scale, rotation, translation, skew, perspective)) {
+                        continue;
+                    }
+                    const double t = static_cast<double>(kf.timeInSeconds[k]) * fps;
+                    out.position.emplace_back(t, ToAiVector3D(translation));
+                    out.rotation.emplace_back(t, RawToAiQuaternion(rotation));
+                    out.scaling.emplace_back(t, ToAiVector3D(scale));
+                    maxTicks = std::max(maxTicks, t);
+                }
+            }
         }
     }
 
