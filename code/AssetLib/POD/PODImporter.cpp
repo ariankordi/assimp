@@ -48,6 +48,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <assimp/importerdesc.h>
 #include <assimp/scene.h>
 
+#include <algorithm>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -142,21 +143,45 @@ static uint32_t ReadFaceIndex(const uint8_t *data, IndexType type, uint32_t i) {
     return reinterpret_cast<const uint16_t *>(data)[i];
 }
 
-// glm is column-major (m[col][row]); aiMatrix4x4 stores rows a1..a4, b1..b4, ...
-static aiMatrix4x4 ToAiMatrix4x4(const glm::mat4 &m) {
-    return aiMatrix4x4(
-            m[0][0], m[1][0], m[2][0], m[3][0],
-            m[0][1], m[1][1], m[2][1], m[3][1],
-            m[0][2], m[1][2], m[2][2], m[3][2],
-            m[0][3], m[1][3], m[2][3], m[3][3]);
-}
-
+// PODReader.cpp negates the rotation quaternion's w component while
+// parsing both static node rotations and animation keyframes (it does
+// this unconditionally, regardless of the authoring SDK version). That
+// negation reverses rotation direction and, empirically, produces a
+// skeleton reflected top-to-bottom for this Miitomo file (authored with
+// SDK 3.5): composing the raw node hierarchy with PVRAssets' own
+// getWorldMatrix()/constructSRT() puts e.g. Spine_2 *below* Waist
+// instead of above it. Negating w back here undoes PODReader's
+// negation and reproduces the expected bind pose.
 static aiQuaternion ToAiQuaternion(const glm::quat &q) {
-    return aiQuaternion(q.w, q.x, q.y, q.z);
+    return aiQuaternion(-q.w, q.x, q.y, q.z);
 }
 
 static aiVector3D ToAiVector3D(const glm::vec3 &v) {
     return aiVector3D(v.x, v.y, v.z);
+}
+
+// Composes a node's bind-pose world transform by walking its aiNode
+// parent chain (all of which were just built from POD's local SRT data,
+// via the corrected ToAiQuaternion above). Used instead of trusting
+// PVRAssets' own precomputed Skeleton::invBindMatrices, because those
+// were baked in at POD-load time using PVRAssets' own (uncorrected)
+// quaternion convention -- mixing them with our corrected node
+// hierarchy would make bone world transform and inverse bind matrix
+// mutually inconsistent, distorting the mesh even in bind pose.
+static aiMatrix4x4 ComputeWorldTransform(const aiNode *node) {
+    aiMatrix4x4 world = node->mTransformation;
+    for (const aiNode *parent = node->mParent; parent != nullptr; parent = parent->mParent) {
+        world = parent->mTransformation * world;
+    }
+    return world;
+}
+
+static unsigned int CountDescendants(const aiNode *n) {
+    unsigned int count = n->mNumChildren;
+    for (unsigned int i = 0; i < n->mNumChildren; ++i) {
+        count += CountDescendants(n->mChildren[i]);
+    }
+    return count;
 }
 
 void PODImporter::BuildNodes(Model &model, aiScene *pScene) {
@@ -205,11 +230,39 @@ void PODImporter::BuildNodes(Model &model, aiScene *pScene) {
     if (rootLevelNodes.size() == 1) {
         pScene->mRootNode = rootLevelNodes[0];
     } else {
-        aiNode *root = new aiNode("POD_RootNode");
-        root->mNumChildren = static_cast<unsigned int>(rootLevelNodes.size());
-        root->mChildren = new aiNode *[root->mNumChildren];
+        // POD's own top level can have several sibling nodes (e.g. mesh nodes
+        // sitting alongside a joint hierarchy root), but assimp needs exactly
+        // one aiScene::mRootNode. Rather than inventing a new node, reuse
+        // whichever existing top-level node has the most descendants (in
+        // practice, the joint hierarchy root) and reparent the rest under it;
+        // its transform is identity in every POD file seen so far, so this is
+        // a purely structural change. Only fabricate a node if every top-level
+        // node is a leaf (no reasonable candidate to reuse).
+        size_t bestIdx = 0;
+        unsigned int bestDescendants = 0;
         for (size_t i = 0; i < rootLevelNodes.size(); ++i) {
-            root->mChildren[i] = rootLevelNodes[i];
+            const unsigned int count = CountDescendants(rootLevelNodes[i]);
+            if (count > bestDescendants) {
+                bestDescendants = count;
+                bestIdx = i;
+            }
+        }
+
+        aiNode *root = nullptr;
+        if (bestDescendants > 0) {
+            root = rootLevelNodes[bestIdx];
+        } else {
+            root = new aiNode("POD_RootNode");
+        }
+
+        for (size_t i = 0; i < rootLevelNodes.size(); ++i) {
+            if (rootLevelNodes[i] == root) continue;
+            aiNode **newChildren = new aiNode *[root->mNumChildren + 1];
+            for (unsigned int c = 0; c < root->mNumChildren; ++c) newChildren[c] = root->mChildren[c];
+            newChildren[root->mNumChildren] = rootLevelNodes[i];
+            delete[] root->mChildren;
+            root->mChildren = newChildren;
+            ++root->mNumChildren;
             rootLevelNodes[i]->mParent = root;
         }
         pScene->mRootNode = root;
@@ -312,9 +365,18 @@ void PODImporter::BuildMeshesAndMaterials(Model &model, aiScene *pScene) {
         const int32_t skeletonId = mesh.getSkeletonId();
         if (skeletonId >= 0 && boneIndexAttr && boneWeightAttr) {
             const Skeleton &skeleton = model.getSkeleton(static_cast<uint32_t>(skeletonId));
-            const uint32_t numInfluences = boneIndexAttr->getN();
+            // Number of bone influences stored per vertex (width of the
+            // BONEWEIGHT/BONEINDEX attributes), NOT the skeleton's bone count.
+            const uint32_t numInfluences = boneWeightAttr->getN();
 
-            std::vector<std::vector<aiVertexWeight>> perBone(skeleton.bones.size());
+            // Skeleton::bones/invBindMatrices are padded past the real bone
+            // count with filler entries (all pointing at node index 0). We
+            // don't need to compute the real count explicitly: any padding
+            // slot simply receives no vertex weights below and is skipped when
+            // emitting aiBones, so iterating the full (padded) array is safe.
+            const size_t numBoneSlots = skeleton.bones.size();
+
+            std::vector<std::vector<aiVertexWeight>> perBone(numBoneSlots);
             for (uint32_t v = 0; v < numVertices; ++v) {
                 float indices[4];
                 float weights[4];
@@ -323,19 +385,21 @@ void PODImporter::BuildMeshesAndMaterials(Model &model, aiScene *pScene) {
                 for (uint32_t j = 0; j < numInfluences && j < 4; ++j) {
                     if (weights[j] <= 0.0f) continue;
                     const auto boneLocal = static_cast<size_t>(std::lround(indices[j]));
-                    if (boneLocal < skeleton.bones.size()) {
+                    if (boneLocal < numBoneSlots) {
                         perBone[boneLocal].push_back(aiVertexWeight(v, weights[j]));
                     }
                 }
             }
 
             std::vector<aiBone *> bones;
-            bones.reserve(skeleton.bones.size());
-            for (size_t b = 0; b < skeleton.bones.size(); ++b) {
+            bones.reserve(numBoneSlots);
+            for (size_t b = 0; b < numBoneSlots; ++b) {
                 if (perBone[b].empty()) continue;
                 aiBone *bone = new aiBone();
-                bone->mName = mNodesByIndex[skeleton.bones[b]]->mName;
-                bone->mOffsetMatrix = ToAiMatrix4x4(skeleton.invBindMatrices[b]);
+                const aiNode *boneNode = mNodesByIndex[skeleton.bones[b]];
+                bone->mName = boneNode->mName;
+                bone->mOffsetMatrix = ComputeWorldTransform(boneNode);
+                bone->mOffsetMatrix.Inverse();
                 bone->mNumWeights = static_cast<unsigned int>(perBone[b].size());
                 bone->mWeights = new aiVertexWeight[perBone[b].size()];
                 std::copy(perBone[b].begin(), perBone[b].end(), bone->mWeights);
