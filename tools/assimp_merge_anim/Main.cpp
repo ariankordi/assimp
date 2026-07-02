@@ -60,6 +60,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <set>
@@ -190,16 +191,32 @@ int main(int argc, char **argv) {
         if (animIndex >= 0 && static_cast<unsigned int>(animIndex) != i) continue;
 
         aiAnimation *anim = animScene->mAnimations[i];
-        unsigned int unmatched = 0;
+
+        // Exporters (e.g. glTF2's AssetWriter) resolve each channel's
+        // mNodeName against the target scene's node list and crash on an
+        // unresolved name rather than skipping it gracefully, so channels
+        // that don't correspond to a node in the model scene must be
+        // dropped here before the merged aiAnimation is ever handed to an
+        // exporter.
+        std::vector<aiNodeAnim *> keptChannels;
+        keptChannels.reserve(anim->mNumChannels);
+        unsigned int dropped = 0;
         for (unsigned int c = 0; c < anim->mNumChannels; ++c) {
             if (modelNodeNames.find(anim->mChannels[c]->mNodeName.C_Str()) == modelNodeNames.end()) {
-                ++unmatched;
+                delete anim->mChannels[c];
+                ++dropped;
+                continue;
             }
+            keptChannels.push_back(anim->mChannels[c]);
         }
-        if (unmatched > 0) {
-            std::fprintf(stderr, "warning: animation '%s' has %u/%u channel(s) whose node name isn't present in '%s' (name mismatch between rigs?)\n",
-                    anim->mName.C_Str(), unmatched, anim->mNumChannels, modelPath.c_str());
+        if (dropped > 0) {
+            std::fprintf(stderr, "warning: animation '%s': dropped %u/%u channel(s) whose node name isn't present in '%s' (name mismatch between rigs?)\n",
+                    anim->mName.C_Str(), dropped, anim->mNumChannels, modelPath.c_str());
         }
+        delete[] anim->mChannels;
+        anim->mNumChannels = static_cast<unsigned int>(keptChannels.size());
+        anim->mChannels = anim->mNumChannels ? new aiNodeAnim *[anim->mNumChannels] : nullptr;
+        std::copy(keptChannels.begin(), keptChannels.end(), anim->mChannels);
 
         merged[oldCount + written++] = anim;
         animScene->mAnimations[i] = nullptr; // ownership transferred; keep animScene's destructor from freeing it
