@@ -63,11 +63,111 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
 
 namespace {
+
+// Assimp's glTF2 exporter (glTF2Exporter.cpp, ExportSkin) builds each skin's
+// joint list by scanning aiMesh::mBones in mesh order, then bone order within
+// each mesh, and assigns joint indices by first-seen order. Downstream pose
+// composers -- raylib's BuildPoseFromParentJoints, used for both its glTF and
+// IQM loaders -- hard-require bones[i].parent < i and silently drop any bone
+// that violates it (leaving it un-parented), which shows up as a distorted
+// skeleton. DCC tools commonly emit mBones in vertex-group creation order,
+// which has no relation to skeleton depth, so the invariant routinely doesn't
+// hold on merged/re-exported rigs. This reorders each mesh's aiBone list into
+// scene-graph (parent-before-child) order, padding in zero-weight placeholder
+// bones for any ancestor missing from a given mesh so that the exporter's
+// global first-seen order comes out correct too. It doesn't change skinning:
+// aiBone array order carries no meaning of its own beyond which joint index a
+// bone name resolves to.
+void SortBonesTopologically(aiScene *scene) {
+    // Pre-order rank over the node tree: a parent's rank is always lower than
+    // any of its descendants'.
+    std::map<std::string, int> rank;
+    std::map<std::string, aiNode *> nodeByName;
+    {
+        std::vector<aiNode *> stack(1, scene->mRootNode);
+        int counter = 0;
+        while (!stack.empty()) {
+            aiNode *n = stack.back();
+            stack.pop_back();
+            rank[n->mName.C_Str()] = counter++;
+            nodeByName[n->mName.C_Str()] = n;
+            for (unsigned int i = n->mNumChildren; i-- > 0;) stack.push_back(n->mChildren[i]);
+        }
+    }
+
+    // One representative aiBone per name, to source the offset/bind matrix
+    // for any zero-weight placeholder bones added below.
+    std::map<std::string, const aiBone *> representative;
+    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+        const aiMesh *mesh = scene->mMeshes[m];
+        for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
+            representative.emplace(mesh->mBones[b]->mName.C_Str(), mesh->mBones[b]);
+        }
+    }
+
+    unsigned int totalPadded = 0;
+    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+        aiMesh *mesh = scene->mMeshes[m];
+        if (mesh->mNumBones == 0) continue;
+
+        std::set<std::string> present;
+        for (unsigned int b = 0; b < mesh->mNumBones; ++b) present.insert(mesh->mBones[b]->mName.C_Str());
+
+        // Any ancestor of a bone already in this mesh that is itself a bone
+        // somewhere in the scene, but isn't in this mesh yet, needs a
+        // zero-weight placeholder so it gets visited (and assigned a joint
+        // index) before its descendant, regardless of which mesh the
+        // exporter happens to process first.
+        std::vector<aiBone *> additions;
+        for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
+            auto nodeIt = nodeByName.find(mesh->mBones[b]->mName.C_Str());
+            aiNode *ancestor = (nodeIt != nodeByName.end()) ? nodeIt->second->mParent : nullptr;
+            while (ancestor != nullptr) {
+                const std::string ancestorName = ancestor->mName.C_Str();
+                auto repIt = representative.find(ancestorName);
+                if (repIt != representative.end() && present.find(ancestorName) == present.end()) {
+                    aiBone *phantom = new aiBone(*repIt->second);
+                    delete[] phantom->mWeights;
+                    phantom->mWeights = nullptr;
+                    phantom->mNumWeights = 0;
+                    additions.push_back(phantom);
+                    present.insert(ancestorName);
+                }
+                ancestor = ancestor->mParent;
+            }
+        }
+
+        if (!additions.empty()) {
+            aiBone **combined = new aiBone *[mesh->mNumBones + additions.size()];
+            std::copy(mesh->mBones, mesh->mBones + mesh->mNumBones, combined);
+            std::copy(additions.begin(), additions.end(), combined + mesh->mNumBones);
+            delete[] mesh->mBones;
+            mesh->mBones = combined;
+            mesh->mNumBones += static_cast<unsigned int>(additions.size());
+            totalPadded += static_cast<unsigned int>(additions.size());
+        }
+
+        std::stable_sort(mesh->mBones, mesh->mBones + mesh->mNumBones,
+                [&rank](const aiBone *a, const aiBone *b) {
+                    const auto ra = rank.find(a->mName.C_Str());
+                    const auto rb = rank.find(b->mName.C_Str());
+                    const int ia = (ra != rank.end()) ? ra->second : std::numeric_limits<int>::max();
+                    const int ib = (rb != rank.end()) ? rb->second : std::numeric_limits<int>::max();
+                    return ia < ib;
+                });
+    }
+
+    if (totalPadded > 0) {
+        std::fprintf(stderr, "note: added %u zero-weight placeholder bone(s) across meshes to keep the exported skin's joint order parent-before-child\n", totalPadded);
+    }
+}
 
 void PrintUsage(const char *argv0) {
     std::fprintf(stderr,
@@ -227,6 +327,8 @@ int main(int argc, char **argv) {
     modelScene->mNumAnimations = oldCount + written;
 
     delete animScene; // safe: transferred aiAnimation slots were nulled out above
+
+    SortBonesTopologically(modelScene);
 
     Assimp::Exporter exporter;
     const aiReturn result = exporter.Export(modelScene, formatId.c_str(), outputPath.c_str(), 0);
