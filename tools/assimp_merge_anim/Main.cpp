@@ -169,17 +169,106 @@ void SortBonesTopologically(aiScene *scene) {
     }
 }
 
+// Some DCC exports give each mesh a skin containing only the bones that
+// mesh's vertices are actually weighted to, rather than the full skeleton.
+// Assimp's glTF2 exporter assigns joint indices by first-seen order while
+// scanning meshes (see SortBonesTopologically above), so a bone that's
+// simply absent from one mesh's aiBone list still gets a consistent index
+// as long as it's present in the union of all meshes -- but on models where
+// a bone in the "total" skeleton isn't referenced by *any* mesh, or where
+// per-mesh bone subsets disagree in relative order, joint indices can drift
+// between skins. This pads every mesh's aiBone list out to the full set of
+// bone names referenced anywhere in the scene (zero-weight placeholders for
+// bones the mesh doesn't influence) and sorts each list into the same
+// parent-before-child scene-graph order, so every mesh's skin agrees on
+// exactly the same bone name -> joint index mapping.
+void UnifySkinsWithSkeleton(aiScene *scene) {
+    std::map<std::string, int> rank;
+    {
+        std::vector<aiNode *> stack(1, scene->mRootNode);
+        int counter = 0;
+        while (!stack.empty()) {
+            aiNode *n = stack.back();
+            stack.pop_back();
+            rank[n->mName.C_Str()] = counter++;
+            for (unsigned int i = n->mNumChildren; i-- > 0;) stack.push_back(n->mChildren[i]);
+        }
+    }
+
+    // Full skeleton: every bone name referenced by any mesh's skin, with one
+    // representative aiBone per name to source the offset matrix for
+    // placeholders added to meshes that don't already have that bone.
+    std::map<std::string, const aiBone *> representative;
+    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+        const aiMesh *mesh = scene->mMeshes[m];
+        for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
+            representative.emplace(mesh->mBones[b]->mName.C_Str(), mesh->mBones[b]);
+        }
+    }
+
+    unsigned int totalPadded = 0;
+    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+        aiMesh *mesh = scene->mMeshes[m];
+        if (mesh->mNumBones == 0) continue; // unskinned mesh: leave alone
+
+        std::set<std::string> present;
+        for (unsigned int b = 0; b < mesh->mNumBones; ++b) present.insert(mesh->mBones[b]->mName.C_Str());
+
+        std::vector<aiBone *> additions;
+        for (const auto &entry : representative) {
+            if (present.find(entry.first) != present.end()) continue;
+            aiBone *phantom = new aiBone(*entry.second);
+            delete[] phantom->mWeights;
+            phantom->mWeights = nullptr;
+            phantom->mNumWeights = 0;
+            additions.push_back(phantom);
+        }
+
+        if (!additions.empty()) {
+            aiBone **combined = new aiBone *[mesh->mNumBones + additions.size()];
+            std::copy(mesh->mBones, mesh->mBones + mesh->mNumBones, combined);
+            std::copy(additions.begin(), additions.end(), combined + mesh->mNumBones);
+            delete[] mesh->mBones;
+            mesh->mBones = combined;
+            mesh->mNumBones += static_cast<unsigned int>(additions.size());
+            totalPadded += static_cast<unsigned int>(additions.size());
+        }
+
+        std::stable_sort(mesh->mBones, mesh->mBones + mesh->mNumBones,
+                [&rank](const aiBone *a, const aiBone *b) {
+                    const auto ra = rank.find(a->mName.C_Str());
+                    const auto rb = rank.find(b->mName.C_Str());
+                    const int ia = (ra != rank.end()) ? ra->second : std::numeric_limits<int>::max();
+                    const int ib = (rb != rank.end()) ? rb->second : std::numeric_limits<int>::max();
+                    return ia < ib;
+                });
+    }
+
+    if (totalPadded > 0) {
+        std::fprintf(stderr, "note: added %u zero-weight placeholder bone(s) across meshes so every mesh's skin covers the full skeleton\n", totalPadded);
+    }
+}
+
 void PrintUsage(const char *argv0) {
     std::fprintf(stderr,
-            "usage: %s <model-file> <anim-file> <output-file> [--format <id>] [--anim-index <n>]\n\n"
+            "usage: %s <model-file> <anim-file> <output-file> [--format <id>] [--anim-index <n>]\n"
+            "       %*s [--no-sort-bones-topologically] [--unify-skins]\n\n"
             "Imports <model-file> (mesh + skeleton) and <anim-file> (animation, sharing\n"
             "the same node/bone names), grafts the animation(s) from <anim-file> onto\n"
             "<model-file>'s scene, and exports the combined result to <output-file>.\n\n"
             "  --format <id>     Explicit assimp export format id (see `assimp listext`).\n"
             "                    If omitted, guessed from <output-file>'s extension.\n"
             "  --anim-index <n>  Merge only animation index n from <anim-file> instead of\n"
-            "                    all of its animations.\n",
-            argv0);
+            "                    all of its animations.\n"
+            "  --no-sort-bones-topologically\n"
+            "                    Skip the fixup that reorders each mesh's bones into\n"
+            "                    parent-before-child order (on by default; see\n"
+            "                    SortBonesTopologically in the source for why).\n"
+            "  --unify-skins     Pad every mesh's skin out to the full skeleton (union of\n"
+            "                    all bones referenced anywhere in the scene) instead of\n"
+            "                    just the bones that particular mesh is weighted to, so\n"
+            "                    bone/joint indices agree across skins. Off by default.\n",
+            argv0, static_cast<int>(std::strlen(argv0)), "");
 }
 
 // Finds the export format id whose recommended extension matches
@@ -217,12 +306,18 @@ int main(int argc, char **argv) {
     const std::string outputPath = argv[3];
     std::string formatId;
     int animIndex = -1;
+    bool sortBonesTopologically = true;
+    bool unifySkins = false;
 
     for (int i = 4; i < argc; ++i) {
         if (std::strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
             formatId = argv[++i];
         } else if (std::strcmp(argv[i], "--anim-index") == 0 && i + 1 < argc) {
             animIndex = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--no-sort-bones-topologically") == 0) {
+            sortBonesTopologically = false;
+        } else if (std::strcmp(argv[i], "--unify-skins") == 0) {
+            unifySkins = true;
         } else {
             std::fprintf(stderr, "unrecognized argument: %s\n", argv[i]);
             PrintUsage(argv[0]);
@@ -328,7 +423,8 @@ int main(int argc, char **argv) {
 
     delete animScene; // safe: transferred aiAnimation slots were nulled out above
 
-    SortBonesTopologically(modelScene);
+    if (unifySkins) UnifySkinsWithSkeleton(modelScene);
+    if (sortBonesTopologically) SortBonesTopologically(modelScene);
 
     Assimp::Exporter exporter;
     const aiReturn result = exporter.Export(modelScene, formatId.c_str(), outputPath.c_str(), 0);
