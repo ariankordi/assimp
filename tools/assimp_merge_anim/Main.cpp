@@ -251,15 +251,24 @@ void UnifySkinsWithSkeleton(aiScene *scene) {
 
 void PrintUsage(const char *argv0) {
     std::fprintf(stderr,
-            "usage: %s <model-file> <anim-file> <output-file> [--format <id>] [--anim-index <n>]\n"
-            "       %*s [--no-sort-bones-topologically] [--unify-skins]\n\n"
-            "Imports <model-file> (mesh + skeleton) and <anim-file> (animation, sharing\n"
-            "the same node/bone names), grafts the animation(s) from <anim-file> onto\n"
-            "<model-file>'s scene, and exports the combined result to <output-file>.\n\n"
+            "usage: %s <output-file> <model-file> <anim-file>... [options]\n\n"
+            "Imports <model-file> (mesh + skeleton) and one or more <anim-file>s\n"
+            "(animation, sharing the same node/bone names as <model-file>), grafts all\n"
+            "of their animations onto <model-file>'s scene, and exports the combined\n"
+            "result to <output-file>.\n\n"
             "  --format <id>     Explicit assimp export format id (see `assimp listext`).\n"
             "                    If omitted, guessed from <output-file>'s extension.\n"
-            "  --anim-index <n>  Merge only animation index n from <anim-file> instead of\n"
-            "                    all of its animations.\n"
+            "  --anim-index <n>  Merge only animation index n from the anim-file most\n"
+            "                    recently named, instead of all of its animations.\n"
+            "                    Repeatable (once per anim-file that needs it).\n"
+            "  --fps <value>     Override mTicksPerSecond on the animation(s) merged from\n"
+            "                    the anim-file most recently named, without touching\n"
+            "                    keyframe times -- use when the source format's reported\n"
+            "                    rate doesn't match how the target engine will play it\n"
+            "                    back (e.g. BFRES exports that come out wrong in glTF).\n"
+            "  --fps-scale <f>   Multiply mTicksPerSecond by <f> instead of setting it\n"
+            "                    outright, for the anim-file most recently named. Mutually\n"
+            "                    exclusive with --fps for the same anim-file.\n"
             "  --no-sort-bones-topologically\n"
             "                    Skip the fixup that reorders each mesh's bones into\n"
             "                    parent-before-child order (on by default; see\n"
@@ -267,8 +276,15 @@ void PrintUsage(const char *argv0) {
             "  --unify-skins     Pad every mesh's skin out to the full skeleton (union of\n"
             "                    all bones referenced anywhere in the scene) instead of\n"
             "                    just the bones that particular mesh is weighted to, so\n"
-            "                    bone/joint indices agree across skins. Off by default.\n",
-            argv0, static_cast<int>(std::strlen(argv0)), "");
+            "                    bone/joint indices agree across skins. Off by default.\n"
+            "  --name-anims-from-file\n"
+            "                    Rename each merged animation after its anim-file's\n"
+            "                    basename (e.g. animActionBlowOff.Anim.pod -> \n"
+            "                    \"animActionBlowOff\"), instead of keeping whatever name\n"
+            "                    the importer gave it. Use this for formats where every\n"
+            "                    animation comes back with the same generic name (e.g.\n"
+            "                    PODImporter always names them \"Default Animation\").\n",
+            argv0);
 }
 
 // Finds the export format id whose recommended extension matches
@@ -293,6 +309,19 @@ std::string GuessExportFormatId(const std::string &outputFile) {
     return {};
 }
 
+// Strips directory components and everything from the first '.' onward, so
+// e.g. "dump/animActionBlowOff.Anim.pod" becomes "animActionBlowOff". Some
+// importers (PODImporter among them) name every aiAnimation the same generic
+// string (e.g. "Default Animation") regardless of source file, which makes
+// merged animations indistinguishable by name; the anim-file's own basename
+// is normally the actual intended animation name in that case.
+std::string BaseNameWithoutExtension(const std::string &path) {
+    const size_t slash = path.find_last_of("/\\");
+    const std::string filename = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    const size_t dot = filename.find('.');
+    return (dot == std::string::npos) ? filename : filename.substr(0, dot);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -301,28 +330,65 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const std::string modelPath = argv[1];
-    const std::string animPath = argv[2];
-    const std::string outputPath = argv[3];
+    const std::string outputPath = argv[1];
+    const std::string modelPath = argv[2];
     std::string formatId;
-    int animIndex = -1;
     bool sortBonesTopologically = true;
     bool unifySkins = false;
+    bool nameAnimsFromFile = false;
 
-    for (int i = 4; i < argc; ++i) {
+    // One entry per positional anim-file argument. --anim-index/--fps/
+    // --fps-scale each apply to whichever anim-file was most recently named,
+    // mirroring how flags read left-to-right, and are repeatable (once per
+    // anim-file that needs one).
+    struct AnimSource {
+        std::string path;
+        int animIndex = -1;
+        double fpsOverride = -1.0;
+        double fpsScale = -1.0;
+    };
+    std::vector<AnimSource> animSources;
+
+    for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
             formatId = argv[++i];
         } else if (std::strcmp(argv[i], "--anim-index") == 0 && i + 1 < argc) {
-            animIndex = std::atoi(argv[++i]);
+            if (animSources.empty()) {
+                std::fprintf(stderr, "error: --anim-index must follow an anim-file argument\n");
+                return 1;
+            }
+            animSources.back().animIndex = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
+            if (animSources.empty()) {
+                std::fprintf(stderr, "error: --fps must follow an anim-file argument\n");
+                return 1;
+            }
+            animSources.back().fpsOverride = std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--fps-scale") == 0 && i + 1 < argc) {
+            if (animSources.empty()) {
+                std::fprintf(stderr, "error: --fps-scale must follow an anim-file argument\n");
+                return 1;
+            }
+            animSources.back().fpsScale = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-sort-bones-topologically") == 0) {
             sortBonesTopologically = false;
         } else if (std::strcmp(argv[i], "--unify-skins") == 0) {
             unifySkins = true;
-        } else {
+        } else if (std::strcmp(argv[i], "--name-anims-from-file") == 0) {
+            nameAnimsFromFile = true;
+        } else if (std::strncmp(argv[i], "--", 2) == 0) {
             std::fprintf(stderr, "unrecognized argument: %s\n", argv[i]);
             PrintUsage(argv[0]);
             return 1;
+        } else {
+            animSources.push_back({argv[i], -1, -1.0, -1.0});
         }
+    }
+
+    if (animSources.empty()) {
+        std::fprintf(stderr, "error: at least one <anim-file> is required\n");
+        PrintUsage(argv[0]);
+        return 1;
     }
 
     if (formatId.empty()) {
@@ -341,27 +407,6 @@ int main(int argc, char **argv) {
     }
     aiScene *modelScene = const_cast<aiScene *>(constModelScene);
 
-    Assimp::Importer animImporter;
-    if (!animImporter.ReadFile(animPath, 0)) {
-        std::fprintf(stderr, "error: failed to import '%s': %s\n", animPath.c_str(), animImporter.GetErrorString());
-        return 1;
-    }
-    // Detach the anim scene from its Importer so we can transfer ownership of
-    // individual aiAnimation objects into modelScene without a double free
-    // when animImporter goes out of scope.
-    aiScene *animScene = animImporter.GetOrphanedScene();
-
-    if (animScene->mNumAnimations == 0) {
-        std::fprintf(stderr, "error: '%s' has no animations to merge\n", animPath.c_str());
-        delete animScene;
-        return 1;
-    }
-    if (animIndex >= 0 && static_cast<unsigned int>(animIndex) >= animScene->mNumAnimations) {
-        std::fprintf(stderr, "error: --anim-index %d out of range (file has %u animation(s))\n", animIndex, animScene->mNumAnimations);
-        delete animScene;
-        return 1;
-    }
-
     // Collect the set of node names present in the model scene so we can warn
     // about (but still carry over) animation channels that won't attach to
     // anything -- a mismatched name is a silent no-op in most exporters.
@@ -376,52 +421,100 @@ int main(int argc, char **argv) {
         }
     }
 
-    const unsigned int oldCount = modelScene->mNumAnimations;
-    const unsigned int mergeCount = (animIndex >= 0) ? 1 : animScene->mNumAnimations;
-    aiAnimation **merged = new aiAnimation *[oldCount + mergeCount];
-    for (unsigned int i = 0; i < oldCount; ++i) merged[i] = modelScene->mAnimations[i];
+    std::vector<aiAnimation *> merged(modelScene->mAnimations, modelScene->mAnimations + modelScene->mNumAnimations);
 
-    unsigned int written = 0;
-    for (unsigned int i = 0; i < animScene->mNumAnimations; ++i) {
-        if (animIndex >= 0 && static_cast<unsigned int>(animIndex) != i) continue;
+    for (const AnimSource &source : animSources) {
+        Assimp::Importer animImporter;
+        if (!animImporter.ReadFile(source.path, 0)) {
+            std::fprintf(stderr, "warning: skipping '%s': failed to import: %s\n", source.path.c_str(), animImporter.GetErrorString());
+            continue;
+        }
+        // Detach the anim scene from its Importer so we can transfer ownership
+        // of individual aiAnimation objects into modelScene without a double
+        // free when animImporter goes out of scope.
+        aiScene *animScene = animImporter.GetOrphanedScene();
 
-        aiAnimation *anim = animScene->mAnimations[i];
+        // A single anim-file with no animations (or an out-of-range
+        // --anim-index) is common when batch-merging many files -- e.g. one
+        // turns out to be a camera-only or otherwise empty export -- and
+        // shouldn't abort the whole run over the rest of the sources.
+        if (animScene->mNumAnimations == 0) {
+            std::fprintf(stderr, "warning: skipping '%s': has no animations to merge\n", source.path.c_str());
+            delete animScene;
+            continue;
+        }
+        if (source.animIndex >= 0 && static_cast<unsigned int>(source.animIndex) >= animScene->mNumAnimations) {
+            std::fprintf(stderr, "warning: skipping '%s': --anim-index %d out of range (file has %u animation(s))\n",
+                    source.path.c_str(), source.animIndex, animScene->mNumAnimations);
+            delete animScene;
+            continue;
+        }
 
-        // Exporters (e.g. glTF2's AssetWriter) resolve each channel's
-        // mNodeName against the target scene's node list and crash on an
-        // unresolved name rather than skipping it gracefully, so channels
-        // that don't correspond to a node in the model scene must be
-        // dropped here before the merged aiAnimation is ever handed to an
-        // exporter.
-        std::vector<aiNodeAnim *> keptChannels;
-        keptChannels.reserve(anim->mNumChannels);
-        unsigned int dropped = 0;
-        for (unsigned int c = 0; c < anim->mNumChannels; ++c) {
-            if (modelNodeNames.find(anim->mChannels[c]->mNodeName.C_Str()) == modelNodeNames.end()) {
-                delete anim->mChannels[c];
-                ++dropped;
-                continue;
+        for (unsigned int i = 0; i < animScene->mNumAnimations; ++i) {
+            if (source.animIndex >= 0 && static_cast<unsigned int>(source.animIndex) != i) continue;
+
+            aiAnimation *anim = animScene->mAnimations[i];
+
+            // Exporters (e.g. glTF2's AssetWriter) resolve each channel's
+            // mNodeName against the target scene's node list and crash on an
+            // unresolved name rather than skipping it gracefully, so channels
+            // that don't correspond to a node in the model scene must be
+            // dropped here before the merged aiAnimation is ever handed to an
+            // exporter.
+            std::vector<aiNodeAnim *> keptChannels;
+            keptChannels.reserve(anim->mNumChannels);
+            unsigned int dropped = 0;
+            for (unsigned int c = 0; c < anim->mNumChannels; ++c) {
+                if (modelNodeNames.find(anim->mChannels[c]->mNodeName.C_Str()) == modelNodeNames.end()) {
+                    delete anim->mChannels[c];
+                    ++dropped;
+                    continue;
+                }
+                keptChannels.push_back(anim->mChannels[c]);
             }
-            keptChannels.push_back(anim->mChannels[c]);
-        }
-        if (dropped > 0) {
-            std::fprintf(stderr, "warning: animation '%s': dropped %u/%u channel(s) whose node name isn't present in '%s' (name mismatch between rigs?)\n",
-                    anim->mName.C_Str(), dropped, anim->mNumChannels, modelPath.c_str());
-        }
-        delete[] anim->mChannels;
-        anim->mNumChannels = static_cast<unsigned int>(keptChannels.size());
-        anim->mChannels = anim->mNumChannels ? new aiNodeAnim *[anim->mNumChannels] : nullptr;
-        std::copy(keptChannels.begin(), keptChannels.end(), anim->mChannels);
+            if (dropped > 0) {
+                std::fprintf(stderr, "warning: animation '%s': dropped %u/%u channel(s) whose node name isn't present in '%s' (name mismatch between rigs?)\n",
+                        anim->mName.C_Str(), dropped, anim->mNumChannels, modelPath.c_str());
+            }
+            delete[] anim->mChannels;
+            anim->mNumChannels = static_cast<unsigned int>(keptChannels.size());
+            anim->mChannels = anim->mNumChannels ? new aiNodeAnim *[anim->mNumChannels] : nullptr;
+            std::copy(keptChannels.begin(), keptChannels.end(), anim->mChannels);
 
-        merged[oldCount + written++] = anim;
-        animScene->mAnimations[i] = nullptr; // ownership transferred; keep animScene's destructor from freeing it
+            if (nameAnimsFromFile) {
+                std::string name = BaseNameWithoutExtension(source.path);
+                // Only this source's own anims are kept when --anim-index is
+                // set, so the basename alone is unambiguous; otherwise merging
+                // several animations out of one file needs a suffix so they
+                // don't all collide on the same name.
+                if (source.animIndex < 0 && animScene->mNumAnimations > 1) {
+                    name += "_" + std::to_string(i);
+                }
+                anim->mName = name.c_str();
+            }
+
+            // Keyframe mTime values are in ticks, scaled to seconds by
+            // mTicksPerSecond; overriding/scaling it here changes playback
+            // speed without touching the keyframes themselves, which is the
+            // right knob when the source format's own reported rate doesn't
+            // match how the target engine ends up interpreting it.
+            if (source.fpsOverride >= 0.0) {
+                anim->mTicksPerSecond = source.fpsOverride;
+            } else if (source.fpsScale >= 0.0) {
+                anim->mTicksPerSecond *= source.fpsScale;
+            }
+
+            merged.push_back(anim);
+            animScene->mAnimations[i] = nullptr; // ownership transferred; keep animScene's destructor from freeing it
+        }
+
+        delete animScene; // safe: transferred aiAnimation slots were nulled out above
     }
 
     delete[] modelScene->mAnimations;
-    modelScene->mAnimations = merged;
-    modelScene->mNumAnimations = oldCount + written;
-
-    delete animScene; // safe: transferred aiAnimation slots were nulled out above
+    modelScene->mAnimations = new aiAnimation *[merged.size()];
+    std::copy(merged.begin(), merged.end(), modelScene->mAnimations);
+    modelScene->mNumAnimations = static_cast<unsigned int>(merged.size());
 
     if (unifySkins) UnifySkinsWithSkeleton(modelScene);
     if (sortBonesTopologically) SortBonesTopologically(modelScene);
