@@ -1109,6 +1109,20 @@ enum aiComponent
  */
 #define AI_CONFIG_IMPORT_COLLADA_USE_COLLADA_NAMES "IMPORT_COLLADA_USE_COLLADA_NAMES"
 
+// ---------------------------------------------------------------------------
+/** @brief Bind-pose scene for the Maya ANIM (.anim) importer.
+ *
+ * Maya ANIM files only contain curves for the attributes that were keyed;
+ * any other translate/rotate/scale axis of an animated node keeps its bind
+ * value, which the file itself doesn't record. When this property points to
+ * an aiScene (usually the model the animation belongs to), each unkeyed axis
+ * is taken from the local transform of the node with the same name in that
+ * scene. The scene is only read during import and not retained.
+ * Property type: Pointer (const aiScene*). Default value: nullptr, meaning
+ * unkeyed axes are 0 (scale: 1).
+ */
+#define AI_CONFIG_IMPORT_MAYA_ANIM_REFERENCE_SCENE "IMPORT_MAYA_ANIM_REFERENCE_SCENE"
+
 // ---------- All the Export defines ------------
 
 /** @brief Specifies the xfile use double for real values of float

@@ -430,6 +430,9 @@ int main(int argc, char **argv) {
     for (const AnimSource &source : animSources) {
         Assimp::Importer animImporter;
         animImporter.SetPropertyInteger(AI_CONFIG_IMPORT_COLLADA_USE_COLLADA_NAMES, 1);
+        // Formats that only store keyed axes (Maya .anim) need the model's bind
+        // pose to fill in the rest; importers that don't use this ignore it.
+        animImporter.SetPropertyPointer(AI_CONFIG_IMPORT_MAYA_ANIM_REFERENCE_SCENE, modelScene);
         if (!animImporter.ReadFile(source.path, 0)) {
             std::fprintf(stderr, "warning: skipping '%s': failed to import: %s\n", source.path.c_str(), animImporter.GetErrorString());
             continue;

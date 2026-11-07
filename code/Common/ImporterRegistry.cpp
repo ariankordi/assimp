@@ -124,6 +124,9 @@ corresponding preprocessor flag to selectively disable formats.
 #ifndef ASSIMP_BUILD_NO_BVH_IMPORTER
 #include "AssetLib/BVH/BVHLoader.h"
 #endif
+#ifndef ASSIMP_BUILD_NO_MAYAANIM_IMPORTER
+#include "AssetLib/MayaAnim/MayaAnimImporter.h"
+#endif
 #ifndef ASSIMP_BUILD_NO_IRRMESH_IMPORTER
 #include "AssetLib/Irr/IRRMeshLoader.h"
 #endif
@@ -309,6 +312,9 @@ void GetImporterInstanceList(std::vector<BaseImporter *> &out) {
 #endif
 #if (!defined ASSIMP_BUILD_NO_BVH_IMPORTER)
     out.push_back(new BVHLoader());
+#endif
+#if (!defined ASSIMP_BUILD_NO_MAYAANIM_IMPORTER)
+    out.push_back(new MayaAnimImporter());
 #endif
 #if (!defined ASSIMP_BUILD_NO_IRRMESH_IMPORTER)
     out.push_back(new IRRMeshImporter());

@@ -377,6 +377,11 @@ ADD_ASSIMP_IMPORTER( BVH
   AssetLib/BVH/BVHLoader.h
 )
 
+ADD_ASSIMP_IMPORTER( MAYAANIM
+  AssetLib/MayaAnim/MayaAnimImporter.cpp
+  AssetLib/MayaAnim/MayaAnimImporter.h
+)
+
 ADD_ASSIMP_IMPORTER( COLLADA
   AssetLib/Collada/ColladaHelper.cpp
   AssetLib/Collada/ColladaHelper.h

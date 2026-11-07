@@ -9,6 +9,7 @@ __Importers__:
 - [AC3D](https://en.wikipedia.org/wiki/AC3D)
 - ACC
 - AMJ
+- [ANIM](https://download.autodesk.com/us/maya/2009help/files/Animation_curves_Anim_File_Format.htm) (Maya ASCII animation curves)
 - ASE
 - ASK
 - B3D

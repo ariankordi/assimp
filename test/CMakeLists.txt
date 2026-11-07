@@ -153,6 +153,7 @@ SET( IMPORTERS
   unit/utMDCImportExport.cpp
   unit/utAssbinImportExport.cpp
   unit/ImportExport/utAssjsonImportExport.cpp
+  unit/ImportExport/utMayaAnimImporter.cpp
   unit/ImportExport/utCOBImportExport.cpp
   unit/ImportExport/utOgreImportExport.cpp
   unit/ImportExport/utQ3BSPFileImportExport.cpp
