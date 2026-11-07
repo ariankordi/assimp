@@ -57,6 +57,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <assimp/Exporter.hpp>
 #include <assimp/Importer.hpp>
+#include <assimp/config.h>
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
 
@@ -400,6 +401,9 @@ int main(int argc, char **argv) {
     }
 
     Assimp::Importer modelImporter;
+    // Collada nodes default to their (often prefixed, e.g. "Armature_chest") id; use the
+    // human-readable name so bones match the other formats' channel names.
+    modelImporter.SetPropertyInteger(AI_CONFIG_IMPORT_COLLADA_USE_COLLADA_NAMES, 1);
     const aiScene *constModelScene = modelImporter.ReadFile(modelPath, 0);
     if (!constModelScene) {
         std::fprintf(stderr, "error: failed to import '%s': %s\n", modelPath.c_str(), modelImporter.GetErrorString());
@@ -425,6 +429,7 @@ int main(int argc, char **argv) {
 
     for (const AnimSource &source : animSources) {
         Assimp::Importer animImporter;
+        animImporter.SetPropertyInteger(AI_CONFIG_IMPORT_COLLADA_USE_COLLADA_NAMES, 1);
         if (!animImporter.ReadFile(source.path, 0)) {
             std::fprintf(stderr, "warning: skipping '%s': failed to import: %s\n", source.path.c_str(), animImporter.GetErrorString());
             continue;
