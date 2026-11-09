@@ -74,6 +74,26 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 namespace {
 
+/// Global (scene-space) transform of a node in the imported (bind) pose.
+aiMatrix4x4 GlobalTransform(const aiNode *node) {
+    aiMatrix4x4 global = node->mTransformation;
+    for (const aiNode *parent = node->mParent; parent != nullptr; parent = parent->mParent) {
+        global = parent->mTransformation * global;
+    }
+    return global;
+}
+
+/// Finds the node that references mesh index meshIndex, or nullptr.
+const aiNode *FindMeshNode(const aiNode *node, unsigned int meshIndex) {
+    for (unsigned int i = 0; i < node->mNumMeshes; ++i) {
+        if (node->mMeshes[i] == meshIndex) return node;
+    }
+    for (unsigned int i = 0; i < node->mNumChildren; ++i) {
+        if (const aiNode *found = FindMeshNode(node->mChildren[i], meshIndex)) return found;
+    }
+    return nullptr;
+}
+
 // Assimp's glTF2 exporter (glTF2Exporter.cpp, ExportSkin) builds each skin's
 // joint list by scanning aiMesh::mBones in mesh order, then bone order within
 // each mesh, and assigns joint indices by first-seen order. Downstream pose
@@ -185,7 +205,7 @@ void SortBonesTopologically(aiScene *scene) {
 // bones the mesh doesn't influence) and sorts each list into the same
 // parent-before-child scene-graph order, so every mesh's skin agrees on
 // exactly the same bone name -> joint index mapping.
-void UnifySkinsWithSkeleton(aiScene *scene) {
+void UnifySkinsWithSkeleton(aiScene *scene, const std::string &skinRoot) {
     std::map<std::string, int> rank;
     {
         std::vector<aiNode *> stack(1, scene->mRootNode);
@@ -209,6 +229,30 @@ void UnifySkinsWithSkeleton(aiScene *scene) {
         }
     }
 
+    // With --skin-root, also take in every unweighted ancestor of those bones up
+    // to and including the named node. Loaders that build their skeleton from a
+    // skin's joints alone (raylib's glTF loader) otherwise lose the transforms of
+    // bones like skl_root that no vertex is weighted to, and animated poses come
+    // out displaced by them.
+    std::set<std::string> ancestors;
+    if (!skinRoot.empty()) {
+        const aiNode *rootNode = scene->mRootNode->FindNode(skinRoot.c_str());
+        if (rootNode == nullptr) {
+            std::fprintf(stderr, "warning: --skin-root '%s' is not a node in the model; ignored\n", skinRoot.c_str());
+        } else {
+            for (const auto &entry : representative) {
+                const aiNode *node = scene->mRootNode->FindNode(entry.first.c_str());
+                // Walk up only when the bone lies under the skin root.
+                bool underRoot = false;
+                for (const aiNode *n = node; n != nullptr; n = n->mParent) underRoot |= (n == rootNode);
+                if (!underRoot) continue;
+                for (const aiNode *n = node->mParent; n != nullptr && n != rootNode->mParent; n = n->mParent) {
+                    if (representative.find(n->mName.C_Str()) == representative.end()) ancestors.insert(n->mName.C_Str());
+                }
+            }
+        }
+    }
+
     unsigned int totalPadded = 0;
     for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
         aiMesh *mesh = scene->mMeshes[m];
@@ -225,6 +269,18 @@ void UnifySkinsWithSkeleton(aiScene *scene) {
             phantom->mWeights = nullptr;
             phantom->mNumWeights = 0;
             additions.push_back(phantom);
+        }
+
+        // Ancestor bones carry no weights; their offset is the inverse bind
+        // transform relative to the mesh's own node, as for any other bone.
+        const aiNode *meshNode = FindMeshNode(scene->mRootNode, m);
+        const aiMatrix4x4 meshGlobal = meshNode != nullptr ? GlobalTransform(meshNode) : aiMatrix4x4();
+        for (const std::string &name : ancestors) {
+            if (present.find(name) != present.end()) continue;
+            aiBone *ancestor = new aiBone();
+            ancestor->mName = aiString(name);
+            ancestor->mOffsetMatrix = GlobalTransform(scene->mRootNode->FindNode(name.c_str())).Inverse() * meshGlobal;
+            additions.push_back(ancestor);
         }
 
         if (!additions.empty()) {
@@ -381,6 +437,10 @@ void PrintUsage(const char *argv0) {
             "                    all bones referenced anywhere in the scene) instead of\n"
             "                    just the bones that particular mesh is weighted to, so\n"
             "                    bone/joint indices agree across skins. Off by default.\n"
+            "  --skin-root <bone>\n"
+            "                    Like --unify-skins, and also add every unweighted ancestor\n"
+            "                    of the skinned bones up to <bone> (e.g. skl_root), for\n"
+            "                    loaders that build the skeleton from one skin's joints.\n"
             "  --name-anims-from-file\n"
             "                    Rename each merged animation after its anim-file's\n"
             "                    basename (e.g. animActionBlowOff.Anim.pod -> \n"
@@ -447,6 +507,7 @@ int main(int argc, char **argv) {
     std::string formatId;
     bool sortBonesTopologically = true;
     bool unifySkins = false;
+    std::string skinRoot;
     bool nameAnimsFromFile = false;
     std::vector<std::string> meshOrder;
     double scale = 1.0;
@@ -487,6 +548,9 @@ int main(int argc, char **argv) {
         } else if (std::strcmp(argv[i], "--no-sort-bones-topologically") == 0) {
             sortBonesTopologically = false;
         } else if (std::strcmp(argv[i], "--unify-skins") == 0) {
+            unifySkins = true;
+        } else if (std::strcmp(argv[i], "--skin-root") == 0 && i + 1 < argc) {
+            skinRoot = argv[++i];
             unifySkins = true;
         } else if (std::strcmp(argv[i], "--name-anims-from-file") == 0) {
             nameAnimsFromFile = true;
@@ -647,7 +711,7 @@ int main(int argc, char **argv) {
     modelScene->mNumAnimations = static_cast<unsigned int>(merged.size());
 
     if (!meshOrder.empty()) ReorderMeshes(modelScene, meshOrder);
-    if (unifySkins) UnifySkinsWithSkeleton(modelScene);
+    if (unifySkins) UnifySkinsWithSkeleton(modelScene, skinRoot);
     if (sortBonesTopologically) SortBonesTopologically(modelScene);
 
     // Runs after the merge so the animations' translations are scaled along with the model.
