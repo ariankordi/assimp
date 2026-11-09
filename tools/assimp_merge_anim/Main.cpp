@@ -63,6 +63,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -250,6 +251,74 @@ void UnifySkinsWithSkeleton(aiScene *scene) {
     }
 }
 
+/// Splits a comma-separated list, dropping empty entries.
+std::vector<std::string> SplitList(const std::string& list) {
+    std::vector<std::string> items;
+    size_t start = 0;
+    while (start <= list.size()) {
+        const size_t comma = list.find(',', start);
+        const size_t end = (comma == std::string::npos) ? list.size() : comma;
+        if (end > start) items.push_back(list.substr(start, end - start));
+        start = end + 1;
+    }
+    return items;
+}
+
+/// Index of the first pattern that is a substring of the mesh's name or of its material's name,
+/// or patterns.size() if none matches.
+size_t MeshOrderRank(const aiScene* scene, const aiMesh* mesh, const std::vector<std::string>& patterns) {
+    const std::string meshName = mesh->mName.C_Str();
+    std::string materialName;
+    if (mesh->mMaterialIndex < scene->mNumMaterials) {
+        materialName = scene->mMaterials[mesh->mMaterialIndex]->GetName().C_Str();
+    }
+    for (size_t i = 0; i < patterns.size(); ++i) {
+        if (meshName.find(patterns[i]) != std::string::npos || materialName.find(patterns[i]) != std::string::npos) {
+            return i;
+        }
+    }
+    return patterns.size();
+}
+
+/// Reorders scene->mMeshes so meshes matching earlier patterns come first (stable within a
+/// pattern; unmatched meshes go last), and remaps every node's mesh indices to match.
+///
+/// Engines that load meshes without names (raylib's Model keeps only an array) can only tell
+/// meshes apart by position, so a fixed order (e.g. pants, then body) is the only way to carry
+/// each mesh's role through the file. Node mesh lists are sorted too, because the glTF2 exporter
+/// merges a node's meshes into one glTF mesh with primitives in node order.
+void ReorderMeshes(aiScene* scene, const std::vector<std::string>& patterns) {
+    std::vector<unsigned int> order(scene->mNumMeshes);
+    for (unsigned int i = 0; i < scene->mNumMeshes; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](unsigned int a, unsigned int b) {
+        return MeshOrderRank(scene, scene->mMeshes[a], patterns) < MeshOrderRank(scene, scene->mMeshes[b], patterns);
+    });
+
+    std::vector<unsigned int> newIndex(scene->mNumMeshes);
+    std::vector<aiMesh*> reordered(scene->mNumMeshes);
+    for (unsigned int position = 0; position < scene->mNumMeshes; ++position) {
+        reordered[position] = scene->mMeshes[order[position]];
+        newIndex[order[position]] = position;
+    }
+    std::copy(reordered.begin(), reordered.end(), scene->mMeshes);
+
+    std::vector<aiNode*> stack(1, scene->mRootNode);
+    while (!stack.empty()) {
+        aiNode* node = stack.back();
+        stack.pop_back();
+        for (unsigned int i = 0; i < node->mNumMeshes; ++i) node->mMeshes[i] = newIndex[node->mMeshes[i]];
+        std::sort(node->mMeshes, node->mMeshes + node->mNumMeshes);
+        for (unsigned int i = 0; i < node->mNumChildren; ++i) stack.push_back(node->mChildren[i]);
+    }
+
+    for (unsigned int position = 0; position < scene->mNumMeshes; ++position) {
+        const aiMesh* mesh = scene->mMeshes[position];
+        const size_t rank = MeshOrderRank(scene, mesh, patterns);
+        std::fprintf(stderr, "mesh %u: '%s'%s\n", position, mesh->mName.C_Str(),
+                rank == patterns.size() ? " (matched no --mesh-order pattern)" : "");
+    }
+}
+
 void PrintUsage(const char *argv0) {
     std::fprintf(stderr,
             "usage: %s <output-file> <model-file> <anim-file>... [options]\n\n"
@@ -284,7 +353,14 @@ void PrintUsage(const char *argv0) {
             "                    \"animActionBlowOff\"), instead of keeping whatever name\n"
             "                    the importer gave it. Use this for formats where every\n"
             "                    animation comes back with the same generic name (e.g.\n"
-            "                    PODImporter always names them \"Default Animation\").\n",
+            "                    PODImporter always names them \"Default Animation\").\n"
+            "  --mesh-order <a,b,...>\n"
+            "                    Reorder meshes: those whose name or material name contains\n"
+            "                    pattern a come first, then b, and so on; unmatched meshes go\n"
+            "                    last. For engines that only know meshes by index.\n"
+            "  --scale <f>       Uniformly scale the result (vertices, skeleton, animation\n"
+            "                    translations) by <f>, using assimp's GlobalScale step, e.g. to\n"
+            "                    bring models from different sources to one unit.\n",
             argv0);
 }
 
@@ -337,6 +413,8 @@ int main(int argc, char **argv) {
     bool sortBonesTopologically = true;
     bool unifySkins = false;
     bool nameAnimsFromFile = false;
+    std::vector<std::string> meshOrder;
+    double scale = 1.0;
 
     // One entry per positional anim-file argument. --anim-index/--fps/
     // --fps-scale each apply to whichever anim-file was most recently named,
@@ -377,6 +455,15 @@ int main(int argc, char **argv) {
             unifySkins = true;
         } else if (std::strcmp(argv[i], "--name-anims-from-file") == 0) {
             nameAnimsFromFile = true;
+        } else if (std::strcmp(argv[i], "--mesh-order") == 0 && i + 1 < argc) {
+            meshOrder = SplitList(argv[++i]);
+        } else if (std::strcmp(argv[i], "--scale") == 0 && i + 1 < argc) {
+            char* end = nullptr;
+            scale = std::strtod(argv[++i], &end);
+            if (end == argv[i] || *end != '\0' || !(scale > 0.0)) {
+                std::fprintf(stderr, "error: --scale needs a positive number, got '%s'\n", argv[i]);
+                return 1;
+            }
         } else if (std::strncmp(argv[i], "--", 2) == 0) {
             std::fprintf(stderr, "unrecognized argument: %s\n", argv[i]);
             PrintUsage(argv[0]);
@@ -524,8 +611,19 @@ int main(int argc, char **argv) {
     std::copy(merged.begin(), merged.end(), modelScene->mAnimations);
     modelScene->mNumAnimations = static_cast<unsigned int>(merged.size());
 
+    if (!meshOrder.empty()) ReorderMeshes(modelScene, meshOrder);
     if (unifySkins) UnifySkinsWithSkeleton(modelScene);
     if (sortBonesTopologically) SortBonesTopologically(modelScene);
+
+    // Runs after the merge so the animations' translations are scaled along with the model.
+    if (scale != 1.0) {
+        modelImporter.SetPropertyFloat(AI_CONFIG_GLOBAL_SCALE_FACTOR_KEY, static_cast<float>(scale));
+        modelScene = const_cast<aiScene *>(modelImporter.ApplyPostProcessing(aiProcess_GlobalScale));
+        if (!modelScene) {
+            std::fprintf(stderr, "error: scaling failed: %s\n", modelImporter.GetErrorString());
+            return 1;
+        }
+    }
 
     Assimp::Exporter exporter;
     const aiReturn result = exporter.Export(modelScene, formatId.c_str(), outputPath.c_str(), 0);
