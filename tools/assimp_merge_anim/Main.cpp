@@ -62,6 +62,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <assimp/scene.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -287,6 +288,33 @@ size_t MeshOrderRank(const aiScene* scene, const aiMesh* mesh, const std::vector
 /// meshes apart by position, so a fixed order (e.g. pants, then body) is the only way to carry
 /// each mesh's role through the file. Node mesh lists are sorted too, because the glTF2 exporter
 /// merges a node's meshes into one glTF mesh with primitives in node order.
+/// Smallest mesh index referenced by a node or any of its descendants, or
+/// UINT_MAX when the subtree holds no meshes.
+unsigned int FirstMeshInSubtree(const aiNode* node) {
+    unsigned int first = UINT_MAX;
+    for (unsigned int i = 0; i < node->mNumMeshes; ++i) first = std::min(first, node->mMeshes[i]);
+    for (unsigned int i = 0; i < node->mNumChildren; ++i) first = std::min(first, FirstMeshInSubtree(node->mChildren[i]));
+    return first;
+}
+
+/// Reorders, at every level, the children that hold meshes by their first mesh
+/// index, leaving mesh-free children (bones) in their original slots.
+void SortChildrenByFirstMesh(aiNode* node) {
+    std::vector<unsigned int> slots;
+    std::vector<aiNode*> meshChildren;
+    for (unsigned int i = 0; i < node->mNumChildren; ++i) {
+        if (FirstMeshInSubtree(node->mChildren[i]) != UINT_MAX) {
+            slots.push_back(i);
+            meshChildren.push_back(node->mChildren[i]);
+        }
+    }
+    std::stable_sort(meshChildren.begin(), meshChildren.end(), [](const aiNode* a, const aiNode* b) {
+        return FirstMeshInSubtree(a) < FirstMeshInSubtree(b);
+    });
+    for (size_t i = 0; i < slots.size(); ++i) node->mChildren[slots[i]] = meshChildren[i];
+    for (unsigned int i = 0; i < node->mNumChildren; ++i) SortChildrenByFirstMesh(node->mChildren[i]);
+}
+
 void ReorderMeshes(aiScene* scene, const std::vector<std::string>& patterns) {
     std::vector<unsigned int> order(scene->mNumMeshes);
     for (unsigned int i = 0; i < scene->mNumMeshes; ++i) order[i] = i;
@@ -310,6 +338,12 @@ void ReorderMeshes(aiScene* scene, const std::vector<std::string>& patterns) {
         std::sort(node->mMeshes, node->mMeshes + node->mNumMeshes);
         for (unsigned int i = 0; i < node->mNumChildren; ++i) stack.push_back(node->mChildren[i]);
     }
+
+    // Some loaders (raylib's glTF loader among them) collect meshes by walking
+    // the node tree rather than by mesh index, so sibling nodes must follow the
+    // same order. Only the children that hold meshes are reordered among their
+    // own slots; skeleton nodes keep their positions.
+    SortChildrenByFirstMesh(scene->mRootNode);
 
     for (unsigned int position = 0; position < scene->mNumMeshes; ++position) {
         const aiMesh* mesh = scene->mMeshes[position];
@@ -357,7 +391,8 @@ void PrintUsage(const char *argv0) {
             "  --mesh-order <a,b,...>\n"
             "                    Reorder meshes: those whose name or material name contains\n"
             "                    pattern a come first, then b, and so on; unmatched meshes go\n"
-            "                    last. For engines that only know meshes by index.\n"
+            "                    last. Sibling nodes are reordered to match, for loaders\n"
+            "                    that collect meshes by walking the node tree.\n"
             "  --scale <f>       Uniformly scale the result (vertices, skeleton, animation\n"
             "                    translations) by <f>, using assimp's GlobalScale step, e.g. to\n"
             "                    bring models from different sources to one unit.\n",
