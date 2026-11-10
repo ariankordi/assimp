@@ -309,6 +309,88 @@ void UnifySkinsWithSkeleton(aiScene *scene, const std::string &skinRoot) {
 }
 
 /// Splits a comma-separated list, dropping empty entries.
+// Some rigs give every bone its own rotated frame in the bind pose (NW4R's Wii
+// Mii bodies point each limb along its local +X), while others keep every
+// bone axis-aligned with the model. Both skin to the same shape, but code that
+// works in a bone's local axes (e.g. per-axis body scaling) sees different
+// axes. This rewrites the subtree under <root> so every bone's bind frame has
+// the orientation of <root>'s parent, without changing how anything looks:
+//   H_i  = bone i's bind rotation relative to <root>'s parent (H of <root>'s parent = identity)
+//   rest/animated local rotation q -> H_parent * q * H_i^-1   (identity at rest)
+//   rest/animated local translation t -> H_parent * t
+//   each skin's offset (inverse bind) matrix O -> Rot(H_i) * O
+// Scale keys are left alone: they're only exact for uniform scale, which is all
+// the rigs this is used on have.
+void ResetJointRotations(aiScene *scene, const std::string &rootName) {
+    aiNode *root = scene->mRootNode->FindNode(rootName.c_str());
+    if (root == nullptr) {
+        std::fprintf(stderr, "warning: --reset-joint-rotations '%s' is not a node in the model; ignored\n", rootName.c_str());
+        return;
+    }
+
+    // First pass, on the untouched rest pose: each subtree node's H and its parent's H.
+    struct Frames {
+        aiQuaternion own;
+        aiQuaternion parent;
+    };
+    std::map<std::string, Frames> frames;
+    std::vector<aiNode *> order;
+    std::vector<std::pair<aiNode *, aiQuaternion>> stack{{root, aiQuaternion()}};
+    while (!stack.empty()) {
+        auto [node, parentFrame] = stack.back();
+        stack.pop_back();
+        aiVector3D scaling, position;
+        aiQuaternion rotation;
+        node->mTransformation.Decompose(scaling, rotation, position);
+        const aiQuaternion own = parentFrame * rotation;
+        frames[node->mName.C_Str()] = {own, parentFrame};
+        order.push_back(node);
+        for (unsigned int i = 0; i < node->mNumChildren; ++i) stack.push_back({node->mChildren[i], own});
+    }
+
+    // Rest pose: rotation becomes identity, translation moves into the parent's new frame.
+    for (aiNode *node : order) {
+        const Frames &f = frames[node->mName.C_Str()];
+        aiVector3D scaling, position;
+        aiQuaternion rotation;
+        node->mTransformation.Decompose(scaling, rotation, position);
+        node->mTransformation = aiMatrix4x4(scaling, aiQuaternion(), f.parent.Rotate(position));
+    }
+
+    // Animation keys, the same mapping per key.
+    for (unsigned int a = 0; a < scene->mNumAnimations; ++a) {
+        const aiAnimation *anim = scene->mAnimations[a];
+        for (unsigned int c = 0; c < anim->mNumChannels; ++c) {
+            aiNodeAnim *channel = anim->mChannels[c];
+            const auto found = frames.find(channel->mNodeName.C_Str());
+            if (found == frames.end()) continue;
+            const Frames &f = found->second;
+            aiQuaternion ownInverse = f.own;
+            ownInverse.Conjugate();
+            for (unsigned int k = 0; k < channel->mNumRotationKeys; ++k) {
+                aiQuaternion &q = channel->mRotationKeys[k].mValue;
+                q = f.parent * q * ownInverse;
+                q.Normalize();
+            }
+            for (unsigned int k = 0; k < channel->mNumPositionKeys; ++k) {
+                aiVector3D &t = channel->mPositionKeys[k].mValue;
+                t = f.parent.Rotate(t);
+            }
+        }
+    }
+
+    // Inverse bind matrices: the bone's bind frame lost its rotation H_i.
+    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+        const aiMesh *mesh = scene->mMeshes[m];
+        for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
+            aiBone *bone = mesh->mBones[b];
+            const auto found = frames.find(bone->mName.C_Str());
+            if (found == frames.end()) continue;
+            bone->mOffsetMatrix = aiMatrix4x4(found->second.own.GetMatrix()) * bone->mOffsetMatrix;
+        }
+    }
+}
+
 std::vector<std::string> SplitList(const std::string& list) {
     std::vector<std::string> items;
     size_t start = 0;
@@ -441,6 +523,11 @@ void PrintUsage(const char *argv0) {
             "                    Like --unify-skins, and also add every unweighted ancestor\n"
             "                    of the skinned bones up to <bone> (e.g. skl_root), for\n"
             "                    loaders that build the skeleton from one skin's joints.\n"
+            "  --reset-joint-rotations <bone>\n"
+            "                    Give every bone under <bone> (and <bone> itself) the\n"
+            "                    orientation of <bone>'s parent in the bind pose, rewriting\n"
+            "                    rest pose, animation keys and inverse bind matrices so the\n"
+            "                    result looks and moves the same.\n"
             "  --name-anims-from-file\n"
             "                    Rename each merged animation after its anim-file's\n"
             "                    basename (e.g. animActionBlowOff.Anim.pod -> \n"
@@ -508,6 +595,7 @@ int main(int argc, char **argv) {
     bool sortBonesTopologically = true;
     bool unifySkins = false;
     std::string skinRoot;
+    std::string resetRotationsRoot;
     bool nameAnimsFromFile = false;
     std::vector<std::string> meshOrder;
     double scale = 1.0;
@@ -552,6 +640,8 @@ int main(int argc, char **argv) {
         } else if (std::strcmp(argv[i], "--skin-root") == 0 && i + 1 < argc) {
             skinRoot = argv[++i];
             unifySkins = true;
+        } else if (std::strcmp(argv[i], "--reset-joint-rotations") == 0 && i + 1 < argc) {
+            resetRotationsRoot = argv[++i];
         } else if (std::strcmp(argv[i], "--name-anims-from-file") == 0) {
             nameAnimsFromFile = true;
         } else if (std::strcmp(argv[i], "--mesh-order") == 0 && i + 1 < argc) {
@@ -710,6 +800,7 @@ int main(int argc, char **argv) {
     std::copy(merged.begin(), merged.end(), modelScene->mAnimations);
     modelScene->mNumAnimations = static_cast<unsigned int>(merged.size());
 
+    if (!resetRotationsRoot.empty()) ResetJointRotations(modelScene, resetRotationsRoot);
     if (!meshOrder.empty()) ReorderMeshes(modelScene, meshOrder);
     if (unifySkins) UnifySkinsWithSkeleton(modelScene, skinRoot);
     if (sortBonesTopologically) SortBonesTopologically(modelScene);
