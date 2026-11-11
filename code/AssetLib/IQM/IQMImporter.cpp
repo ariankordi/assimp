@@ -124,7 +124,7 @@ const aiImporterDesc *IQMImporter::GetInfo() const {
 namespace {
 
 /// Throws unless @p count elements of @p elementSize bytes at @p offset lie inside the file.
-void CheckRange(size_t fileSize, size_t offset, size_t count, size_t elementSize, const char *what) {
+void CheckRange(uint64_t fileSize, uint64_t offset, uint64_t count, uint64_t elementSize, const char *what) {
     if (count == 0) {
         return;
     }
@@ -133,16 +133,18 @@ void CheckRange(size_t fileSize, size_t offset, size_t count, size_t elementSize
     }
 }
 
-constexpr size_t cMaxAnimationKeys = size_t(1) << 26;   ///< Poses x frames over all animations (~5 GB of keys).
-constexpr size_t cMaxPaddedBones = size_t(1) << 20;     ///< Meshes x joints before weightless bones are left out.
+// Products of file values are computed in uint64_t throughout: size_t is 32 bits on wasm32.
+constexpr uint64_t cMaxAnimationKeys = uint64_t(1) << 26; ///< Poses x frames over all animations.
+constexpr uint64_t cMaxPaddedBones = uint64_t(1) << 20;   ///< Meshes x joints before weightless bones are left out.
+constexpr uint64_t cMaxSkinWeights = uint64_t(1) << 26;   ///< Vertex weights over all meshes (meshes may share vertices).
 
 /// Rejects files whose sections overlap the header or each other (sections are byte-swapped in
 /// place on big-endian hosts, so an overlap could change values after they were validated), or
 /// whose sections are not 4-byte aligned as iqm.txt requires (they are read in place as structs).
 void CheckSectionLayout(const iqmheader &hdr) {
-    struct Section { size_t begin, end; };
+    struct Section { uint64_t begin, end; };
     std::vector<Section> sections;
-    auto add = [&](size_t offset, size_t count, size_t size) {
+    auto add = [&](uint64_t offset, uint64_t count, uint64_t size) {
         if (count == 0) return;
         if (size > 1 && offset % 4 != 0) {
             throw DeadlyImportError("IQM: a section is not 4-byte aligned.");
@@ -156,9 +158,9 @@ void CheckSectionLayout(const iqmheader &hdr) {
     add(hdr.ofs_joints, hdr.num_joints, sizeof(iqmjoint));
     add(hdr.ofs_poses, hdr.num_poses, sizeof(iqmpose));
     add(hdr.ofs_anims, hdr.num_anims, sizeof(iqmanim));
-    add(hdr.ofs_frames, static_cast<size_t>(hdr.num_frames) * hdr.num_framechannels, sizeof(uint16_t));
+    add(hdr.ofs_frames, static_cast<uint64_t>(hdr.num_frames) * hdr.num_framechannels, sizeof(uint16_t));
     std::sort(sections.begin(), sections.end(), [](const Section &a, const Section &b) { return a.begin < b.begin; });
-    size_t previousEnd = sizeof(iqmheader);
+    uint64_t previousEnd = sizeof(iqmheader);
     for (const Section &section : sections) {
         if (section.begin < previousEnd) {
             throw DeadlyImportError("IQM: file sections overlap each other or the header.");
@@ -243,7 +245,7 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
     CheckRange(fileSize, hdr.ofs_poses, hdr.num_poses, sizeof(iqmpose), "poses");
     CheckRange(fileSize, hdr.ofs_anims, hdr.num_anims, sizeof(iqmanim), "animations");
     if (hdr.num_framechannels != 0) {
-        CheckRange(fileSize, hdr.ofs_frames, static_cast<size_t>(hdr.num_frames) * hdr.num_framechannels, sizeof(uint16_t), "frames");
+        CheckRange(fileSize, hdr.ofs_frames, static_cast<uint64_t>(hdr.num_frames) * hdr.num_framechannels, sizeof(uint16_t), "frames");
     }
     CheckSectionLayout(hdr);
 
@@ -319,13 +321,14 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
             throw DeadlyImportError("IQM: a float vertex array is not 4-byte aligned.");
         }
         if (componentSize != 0) {
-            CheckRange(fileSize, array->offset, static_cast<size_t>(hdr.num_vertexes) * array->size, componentSize, "vertex data");
+            CheckRange(fileSize, array->offset, static_cast<uint64_t>(hdr.num_vertexes) * array->size, componentSize, "vertex data");
         }
     }
     // Triangles are swapped per mesh below, so swap them all once here instead (meshes may share ranges).
     swap_block(reinterpret_cast<uint32_t *>(data + hdr.ofs_triangles), static_cast<size_t>(hdr.num_triangles) * sizeof(iqmtriangle));
 
     // Read all surfaces from the file
+    uint64_t totalSkinWeights = 0; // Over all meshes, which may share vertex ranges.
     for( auto imesh = reinterpret_cast<iqmmesh*>( data + hdr.ofs_meshes ), end_ = imesh + hdr.num_meshes; imesh != end_; ++imesh )
     {
         swap_block( &imesh->name, sizeof( iqmmesh ) );
@@ -493,11 +496,15 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
         const bool hasWeights = blendWeightBytes != nullptr || blendWeightFloats != nullptr;
         // Weightless bones keep the whole skeleton through a re-export, but cost a bone per joint
         // per mesh; leave them out when a file asks for an absurd number of those.
-        const bool padBones = static_cast<size_t>(hdr.num_meshes) * hdr.num_joints <= cMaxPaddedBones;
+        const bool padBones = static_cast<uint64_t>(hdr.num_meshes) * hdr.num_joints <= cMaxPaddedBones;
         if (blendIndices != nullptr && hasWeights && hdr.num_joints > 0 && mesh->mNumVertices > 0
                 && mesh->mNumVertices == imesh->num_vertexes) {
             std::vector<std::vector<aiVertexWeight>> weightsPerJoint(hdr.num_joints);
             const unsigned int influences = std::min(blendIndexStep, blendWeightStep);
+            totalSkinWeights += static_cast<uint64_t>(mesh->mNumVertices) * influences;
+            if (totalSkinWeights > cMaxSkinWeights) {
+                throw DeadlyImportError("IQM: the meshes ask for more than ", cMaxSkinWeights, " skin weights.");
+            }
             for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
                 for (unsigned int k = 0; k < influences; ++k) {
                     const unsigned int joint = blendIndices[v * blendIndexStep + k];
@@ -584,18 +591,19 @@ void IQMImporter::ReadAnimations(unsigned char *data, const iqmheader &hdr, cons
         throw DeadlyImportError("IQM: the pose masks give ", channelsPerFrame, " channels per frame, the header ", hdr.num_framechannels, ".");
     }
     auto frames = reinterpret_cast<uint16_t *>(data + hdr.ofs_frames);
-    for (size_t i = 0, count = static_cast<size_t>(hdr.num_frames) * hdr.num_framechannels; i < count; ++i) {
+    for (uint64_t i = 0, count = static_cast<uint64_t>(hdr.num_frames) * hdr.num_framechannels; i < count; ++i) {
         AI_SWAP2(frames[i]);
     }
 
     auto anims = reinterpret_cast<iqmanim *>(data + hdr.ofs_anims);
     // Frames with no channels take no file space, so their count is otherwise unbounded:
     // cap the keys all animations would allocate before allocating any.
-    size_t totalKeys = 0;
+    uint64_t totalKeys = 0;
     for (unsigned int a = 0; a < hdr.num_anims; ++a) {
         uint32_t frameCount = anims[a].num_frames;
         AI_SWAP4(frameCount);
-        totalKeys += static_cast<size_t>(frameCount) * hdr.num_poses;
+        // Both factors are 32-bit and the running total stays below the cap, so this cannot wrap.
+        totalKeys += static_cast<uint64_t>(frameCount) * hdr.num_poses;
         if (totalKeys > cMaxAnimationKeys) {
             throw DeadlyImportError("IQM: the animations ask for more than ", cMaxAnimationKeys, " keys.");
         }
