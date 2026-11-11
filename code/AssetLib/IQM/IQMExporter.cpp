@@ -119,6 +119,8 @@ constexpr double cMaxNativeFrameRate = 240.0;         ///< Above this, ticks are
 constexpr double cFrameGridTolerance = 1e-3;          ///< In frames: how close a key must sit to a frame boundary.
 constexpr double cFallbackFrameRate = 60.0;           ///< Used when no standard rate hits every key time.
 constexpr float cRestEpsilon = 1e-5f;                 ///< Key values this close to the rest pose do not move a node.
+constexpr double cMaxFramesPerAnimation = 1e6;        ///< Rejects absurd durations (a day at 60 fps is ~5e6).
+constexpr size_t cMaxFrameTransforms = size_t(1) << 28; ///< Frames x joints; about 11 GB of transforms.
 constexpr unsigned int cMaxExtraUvSets = AI_MAX_NUMBER_OF_TEXTURECOORDS - 1;
 
 /// Frame rates tried, lowest first, when an animation's ticks are not frames.
@@ -279,6 +281,10 @@ std::vector<MeshInstance> CollectMeshInstances(const aiScene* scene) {
     std::vector<MeshInstance> instances;
     VisitDepthFirst(scene->mRootNode, [&](const aiNode* node) {
         for (unsigned int i = 0; i < node->mNumMeshes; ++i) {
+            if (node->mMeshes[i] >= scene->mNumMeshes) {
+                throw DeadlyExportError("IQM: node '", node->mName.C_Str(), "' references mesh ", node->mMeshes[i],
+                        " of ", scene->mNumMeshes, ".");
+            }
             instances.push_back({ node, scene->mMeshes[node->mMeshes[i]] });
         }
     });
@@ -554,7 +560,9 @@ private:
         unsigned int skippedFaces = 0;
         for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
             const aiFace& face = mesh->mFaces[f];
-            if (face.mNumIndices != 3) {
+            const bool inRange = face.mNumIndices == 3 && face.mIndices[0] < mesh->mNumVertices
+                    && face.mIndices[1] < mesh->mNumVertices && face.mIndices[2] < mesh->mNumVertices;
+            if (!inRange) {
                 ++skippedFaces;
                 continue;
             }
@@ -564,7 +572,8 @@ private:
                     record.firstVertex + face.mIndices[1] });
         }
         if (skippedFaces > 0) {
-            ASSIMP_LOG_WARN("IQM: mesh '", mesh->mName.C_Str(), "': skipped ", skippedFaces, " point/line primitive(s).");
+            ASSIMP_LOG_WARN("IQM: mesh '", mesh->mName.C_Str(), "': skipped ", skippedFaces,
+                    " point/line primitive(s) or face(s) with out-of-range indices.");
         }
         record.triangleCount = static_cast<uint32_t>(mTriangles.size()) - record.firstTriangle;
         mMeshes.push_back(record);
@@ -765,6 +774,9 @@ private:
         if (count == 1 || time <= keys[0].mTime) return keys[0].mValue;
         if (time >= keys[count - 1].mTime) return keys[count - 1].mValue;
         const Key* next = std::upper_bound(keys, keys + count, time, [](double t, const Key& key) { return t < key.mTime; });
+        // Only reachable with unsorted or non-finite key times; hold the nearest end key.
+        if (next == keys) return keys[0].mValue;
+        if (next == keys + count) return keys[count - 1].mValue;
         const Key* previous = next - 1;
         if (previous->mInterpolation == aiAnimInterpolation_Step) return previous->mValue;
         const double span = next->mTime - previous->mTime;
@@ -816,7 +828,14 @@ private:
         const double ticksPerSecond = animation->mTicksPerSecond > 0.0 ? animation->mTicksPerSecond : cDefaultTicksPerSecond;
         const double frameRate = ChooseFrameRate(animation, ticksPerSecond);
         const double durationFrames = animation->mDuration / ticksPerSecond * frameRate;
+        if (!std::isfinite(durationFrames) || durationFrames > cMaxFramesPerAnimation) {
+            throw DeadlyExportError("IQM: animation '", animation->mName.C_Str(), "' has an unusable duration (",
+                    animation->mDuration, " ticks at ", ticksPerSecond, " ticks/s).");
+        }
         const auto frameCount = static_cast<uint32_t>(std::llround(std::max(durationFrames, 0.0))) + 1;
+        if ((static_cast<size_t>(mFrameCount) + frameCount) * mJoints.size() > cMaxFrameTransforms) {
+            throw DeadlyExportError("IQM: the animations exceed ", cMaxFrameTransforms, " joint transforms in total.");
+        }
 
         iqmanim record{};
         record.name = mStrings.Add(animation->mName.C_Str());
