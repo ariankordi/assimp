@@ -1194,6 +1194,21 @@ enum aiComponent
  */
 #define AI_CONFIG_EXPORT_BLOB_NAME "EXPORT_BLOB_NAME"
 
+/** @brief Write IQM files in assimp's Y-up axes instead of IQM's conventional Z-up.
+ *
+ * Use this for loaders that take IQM coordinates as-is (raylib does).
+ * Property type: Bool. Default value: false.
+ */
+#define AI_CONFIG_EXPORT_IQM_Y_UP "EXPORT_IQM_Y_UP"
+
+/** @brief Frame rate (frames per second) to sample every animation at when exporting IQM.
+ *
+ * 0 picks a rate per animation: the source's own ticks when they are frame numbers,
+ * else the lowest standard rate (24, 25, 30, 48, 50, 60, 120, 240) that every key falls on.
+ * Property type: float. Default value: 0.
+ */
+#define AI_CONFIG_EXPORT_IQM_FRAMERATE "EXPORT_IQM_FRAMERATE"
+
 /**
  *  @brief  Specifies a global key factor for scale, float value
  */

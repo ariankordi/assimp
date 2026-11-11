@@ -677,6 +677,11 @@ if (NOT ASSIMP_NO_EXPORT)
     AssetLib/Ply/PlyExporter.cpp
     AssetLib/Ply/PlyExporter.h)
 
+  ADD_ASSIMP_EXPORTER( IQM
+    AssetLib/IQM/IQMExporter.h
+    AssetLib/IQM/IQMExporter.cpp
+    AssetLib/IQM/iqm.h)
+
   ADD_ASSIMP_EXPORTER( 3DS
     AssetLib/3DS/3DSExporter.h
     AssetLib/3DS/3DSExporter.cpp)

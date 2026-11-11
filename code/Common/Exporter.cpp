@@ -106,6 +106,9 @@ void ExportSceneSTLBinary(const char*,IOSystem*, const aiScene*, const ExportPro
 void ExportScenePly(const char*,IOSystem*, const aiScene*, const ExportProperties*);
 void ExportScenePlyBinary(const char*, IOSystem*, const aiScene*, const ExportProperties*);
 #endif
+#ifndef ASSIMP_BUILD_NO_IQM_EXPORTER
+void ExportSceneIQM(const char*, IOSystem*, const aiScene*, const ExportProperties*);
+#endif
 #ifndef ASSIMP_BUILD_NO_3DS_EXPORTER
 void ExportScene3DS(const char*, IOSystem*, const aiScene*, const ExportProperties*);
 #endif
@@ -194,6 +197,11 @@ static void setupExporterArray(std::vector<Exporter::ExportFormatEntry> &exporte
 			aiProcess_JoinIdenticalVertices | aiProcess_Triangulate | aiProcess_SortByPType);
 	exporters.emplace_back("glb", "GL Transmission Format (binary)", "glb", &ExportSceneGLB,
 			aiProcess_JoinIdenticalVertices | aiProcess_Triangulate | aiProcess_SortByPType);
+#endif
+
+#ifndef ASSIMP_BUILD_NO_IQM_EXPORTER
+	exporters.emplace_back("iqm", "Inter-Quake Model", "iqm", &ExportSceneIQM,
+			aiProcess_Triangulate | aiProcess_JoinIdenticalVertices);
 #endif
 
 #ifndef ASSIMP_BUILD_NO_ASSBIN_EXPORTER
