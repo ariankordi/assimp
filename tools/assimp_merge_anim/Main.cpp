@@ -493,7 +493,7 @@ void ReorderMeshes(aiScene* scene, const std::vector<std::string>& patterns) {
 
 void PrintUsage(const char *argv0) {
     std::fprintf(stderr,
-            "usage: %s <output-file> <model-file> <anim-file>... [options]\n\n"
+            "usage: %s <output-file> <model-file> [<anim-file>...] [options]\n\n"
             "Imports <model-file> (mesh + skeleton) and one or more <anim-file>s\n"
             "(animation, sharing the same node/bone names as <model-file>), grafts all\n"
             "of their animations onto <model-file>'s scene, and exports the combined\n"
@@ -542,7 +542,12 @@ void PrintUsage(const char *argv0) {
             "                    that collect meshes by walking the node tree.\n"
             "  --scale <f>       Uniformly scale the result (vertices, skeleton, animation\n"
             "                    translations) by <f>, using assimp's GlobalScale step, e.g. to\n"
-            "                    bring models from different sources to one unit.\n",
+            "                    bring models from different sources to one unit.\n"
+            "  --iqm-y-up        IQM output: keep assimp's Y-up axes instead of IQM's Z-up\n"
+            "                    (for loaders that take IQM coordinates as-is, like raylib).\n"
+            "  --iqm-fps <f>     IQM output: sample every animation at <f> frames per second\n"
+            "                    (default: each animation's own frame rate, see the exporter).\n"
+            "\nWith no <anim-file>, the model is converted with its own animations, if any.\n",
             argv0);
 }
 
@@ -584,7 +589,7 @@ std::string BaseNameWithoutExtension(const std::string &path) {
 } // namespace
 
 int main(int argc, char **argv) {
-    if (argc < 4) {
+    if (argc < 3) {
         PrintUsage(argv[0]);
         return 1;
     }
@@ -599,6 +604,8 @@ int main(int argc, char **argv) {
     bool nameAnimsFromFile = false;
     std::vector<std::string> meshOrder;
     double scale = 1.0;
+    // Exporter options; only exporters that know a key read it.
+    Assimp::ExportProperties exportProperties;
 
     // One entry per positional anim-file argument. --anim-index/--fps/
     // --fps-scale each apply to whichever anim-file was most recently named,
@@ -653,6 +660,15 @@ int main(int argc, char **argv) {
                 std::fprintf(stderr, "error: --scale needs a positive number, got '%s'\n", argv[i]);
                 return 1;
             }
+        } else if (std::strcmp(argv[i], "--iqm-y-up") == 0) {
+            exportProperties.SetPropertyBool(AI_CONFIG_EXPORT_IQM_Y_UP, true);
+        } else if (std::strcmp(argv[i], "--iqm-fps") == 0 && i + 1 < argc) {
+            const double fps = std::atof(argv[++i]);
+            if (!(fps > 0.0)) {
+                std::fprintf(stderr, "error: --iqm-fps needs a positive number, got '%s'\n", argv[i]);
+                return 1;
+            }
+            exportProperties.SetPropertyFloat(AI_CONFIG_EXPORT_IQM_FRAMERATE, static_cast<ai_real>(fps));
         } else if (std::strncmp(argv[i], "--", 2) == 0) {
             std::fprintf(stderr, "unrecognized argument: %s\n", argv[i]);
             PrintUsage(argv[0]);
@@ -660,12 +676,6 @@ int main(int argc, char **argv) {
         } else {
             animSources.push_back({argv[i], -1, -1.0, -1.0});
         }
-    }
-
-    if (animSources.empty()) {
-        std::fprintf(stderr, "error: at least one <anim-file> is required\n");
-        PrintUsage(argv[0]);
-        return 1;
     }
 
     if (formatId.empty()) {
@@ -816,7 +826,7 @@ int main(int argc, char **argv) {
     }
 
     Assimp::Exporter exporter;
-    const aiReturn result = exporter.Export(modelScene, formatId.c_str(), outputPath.c_str(), 0);
+    const aiReturn result = exporter.Export(modelScene, formatId.c_str(), outputPath.c_str(), 0, &exportProperties);
     if (result != aiReturn_SUCCESS) {
         std::fprintf(stderr, "error: export failed: %s\n", exporter.GetErrorString());
         return 1;
