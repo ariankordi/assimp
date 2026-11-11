@@ -50,6 +50,11 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <assimp/BaseImporter.h>
 #include <assimp/material.h>
 
+#include <string>
+#include <vector>
+
+struct iqmheader;
+
 namespace Assimp {
 
 class IQMImporter : public BaseImporter {
@@ -70,7 +75,14 @@ protected:
     void InternReadFile(const std::string &pFile, aiScene *pScene, IOSystem *pIOHandler) override;
 
 private:
+    /// Reads the poses, frames and animations into mScene (channels named after the joints).
+    void ReadAnimations(unsigned char *data, const iqmheader &hdr, const std::vector<std::string> &jointNames);
+
+    /// Builds nodes "pose<n>" from the poses of a file without joints (animation-only files).
+    void ReadPoseNodes(unsigned char *data, const iqmheader &hdr);
+
     aiScene *mScene = nullptr; // the scene to import to
+    bool mPosesSwapped = false; ///< ReadPoseNodes already byte-swapped the poses.
 };
 
 } // Namespace Assimp

@@ -315,18 +315,30 @@ bool ChannelMovesNode(const aiNodeAnim* channel, const aiNode* node) {
     return false;
 }
 
-/// Picks the joints, in depth-first order so every parent precedes its children:
-///   - every node a mesh bone names;
-///   - the nodes between such a bone and its nearest bone ancestor, so a chain is never broken;
-///   - ancestors of those that some animation moves away from their rest pose (and the nodes
-///     between), because such a node moves the skeleton and IQM can only animate joints.
-///     Other ancestors are folded into the root joints instead.
+/// Picks the joints and their order.
+///
+/// Joints:
+///   - every node a mesh bone names (without any bones, as in an animation-only scene: every
+///     node an animation channel targets);
+///   - the nodes between such a node and its nearest such ancestor, so a chain is never broken;
+///   - ancestors that some animation moves away from their rest pose (and the nodes between),
+///     because such a node moves the skeleton and IQM can only animate joints. Other ancestors
+///     are folded into the root joints instead.
+///
+/// Order: the order the bones first appear in (the skin's order for most importers; the joint
+/// order for IQM files, so a re-export keeps indices that separate animation files rely on),
+/// with each joint moved only as far ahead as needed to follow its parent. A joint that is not a
+/// bone takes the place of the first bone below it.
 std::vector<Joint> CollectJoints(const aiScene* scene, const std::vector<MeshInstance>& instances,
         const aiMatrix4x4& axis) {
-    std::map<std::string, bool> boneNames;
+    std::map<std::string, size_t> seedRank; // Name -> first-appearance index.
+    auto addSeed = [&](const aiString& name) { seedRank.emplace(name.C_Str(), seedRank.size()); };
     for (const MeshInstance& instance : instances) {
-        for (unsigned int b = 0; b < instance.mesh->mNumBones; ++b) {
-            boneNames[instance.mesh->mBones[b]->mName.C_Str()] = true;
+        for (unsigned int b = 0; b < instance.mesh->mNumBones; ++b) addSeed(instance.mesh->mBones[b]->mName);
+    }
+    if (seedRank.empty()) {
+        for (unsigned int a = 0; a < scene->mNumAnimations; ++a) {
+            for (unsigned int c = 0; c < scene->mAnimations[a]->mNumChannels; ++c) addSeed(scene->mAnimations[a]->mChannels[c]->mNodeName);
         }
     }
 
@@ -340,36 +352,60 @@ std::vector<Joint> CollectJoints(const aiScene* scene, const std::vector<MeshIns
         }
     }
 
-    std::map<const aiNode*, bool> isJoint;
+    // Mark the joints, and give each the lowest seed rank in its subtree.
+    std::map<const aiNode*, size_t> rank;
     VisitDepthFirst(scene->mRootNode, [&](const aiNode* node) {
-        if (boneNames.count(node->mName.C_Str()) == 0) return;
-        isJoint[node] = true;
-        // Walk up the ancestors. The topmost one that is a bone or animated becomes a joint,
-        // and so does every node between it and this bone.
-        std::vector<const aiNode*> path;
-        size_t keep = 0; // How many entries of path (from the bottom) become joints.
+        const auto seed = seedRank.find(node->mName.C_Str());
+        if (seed == seedRank.end()) return;
+        // Walk up the ancestors. The topmost one that is a seed or animated becomes a joint,
+        // and so does every node between it and this one.
+        std::vector<const aiNode*> path(1, node);
+        size_t keep = 1; // How many entries of path (from the bottom) become joints.
         for (const aiNode* ancestor = node->mParent; ancestor != nullptr; ancestor = ancestor->mParent) {
             path.push_back(ancestor);
             const std::string name = ancestor->mName.C_Str();
-            if (boneNames.count(name) != 0 || animatedNames.count(name) != 0) keep = path.size();
+            if (seedRank.count(name) != 0 || animatedNames.count(name) != 0) keep = path.size();
         }
-        for (size_t i = 0; i < keep; ++i) isJoint[path[i]] = true;
+        for (size_t i = 0; i < keep; ++i) {
+            const auto found = rank.find(path[i]);
+            rank[path[i]] = found == rank.end() ? seed->second : std::min(found->second, seed->second);
+        }
     });
 
+    // Parent joints, and the roots and children lists for the ordering below.
+    std::map<const aiNode*, const aiNode*> parentJoint;
+    std::map<const aiNode*, std::vector<const aiNode*>> childJoints;
+    std::vector<const aiNode*> ready;
+    VisitDepthFirst(scene->mRootNode, [&](const aiNode* node) {
+        if (rank.count(node) == 0) return;
+        const aiNode* ancestor = node->mParent;
+        while (ancestor != nullptr && rank.count(ancestor) == 0) ancestor = ancestor->mParent;
+        parentJoint[node] = ancestor;
+        if (ancestor != nullptr) childJoints[ancestor].push_back(node);
+        else ready.push_back(node);
+    });
+
+    // Emit the lowest-ranked joint whose parent is already out (ties keep depth-first order,
+    // which puts an ancestor ahead of the bone whose rank it shares).
     std::vector<Joint> joints;
     std::map<const aiNode*, int> jointIndex;
-    VisitDepthFirst(scene->mRootNode, [&](const aiNode* node) {
-        if (isJoint.count(node) == 0) return;
+    while (!ready.empty()) {
+        const auto next = std::min_element(ready.begin(), ready.end(),
+                [&](const aiNode* a, const aiNode* b) { return rank.at(a) < rank.at(b); });
+        const aiNode* node = *next;
+        ready.erase(next);
+        const std::vector<const aiNode*>& children = childJoints[node];
+        ready.insert(ready.end(), children.begin(), children.end());
+
         Joint joint;
         joint.node = node;
         // Multiply up the non-joint ancestors until the parent joint (or the scene root).
         aiMatrix4x4 prefix;
-        const aiNode* ancestor = node->mParent;
-        for (; ancestor != nullptr && isJoint.count(ancestor) == 0; ancestor = ancestor->mParent) {
+        for (const aiNode* ancestor = node->mParent; ancestor != parentJoint.at(node); ancestor = ancestor->mParent) {
             prefix = ancestor->mTransformation * prefix;
         }
-        if (ancestor != nullptr) {
-            joint.parent = jointIndex.at(ancestor);
+        if (parentJoint.at(node) != nullptr) {
+            joint.parent = jointIndex.at(parentJoint.at(node));
         } else {
             prefix = axis * prefix;
         }
@@ -378,7 +414,7 @@ std::vector<Joint> CollectJoints(const aiScene* scene, const std::vector<MeshIns
         joint.base = DecomposeTransform(joint.hasPrefix ? prefix * node->mTransformation : node->mTransformation);
         jointIndex[node] = static_cast<int>(joints.size());
         joints.push_back(joint);
-    });
+    }
 
     if (joints.size() > cMaxJoints) {
         throw DeadlyExportError("IQM: ", joints.size(), " joints; IQM's byte blend indices allow at most ", cMaxJoints, ".");
@@ -786,7 +822,7 @@ private:
 
     void BuildAnimations() {
         if (mJoints.empty() || mScene->mNumAnimations == 0) {
-            if (mScene->mNumAnimations > 0) ASSIMP_LOG_WARN("IQM: the scene has animations but no skinned joints; animations not exported.");
+            if (mScene->mNumAnimations > 0) ASSIMP_LOG_WARN("IQM: the scene's animations target no nodes; animations not exported.");
             return;
         }
         std::vector<JointTransform> baseLocals;
@@ -863,7 +899,7 @@ private:
             }
             previous = frame;
             mFrames.insert(mFrames.end(), frame.begin(), frame.end());
-            mBounds.push_back(FrameBounds(frame, inverseBase));
+            if (!mVertices.positions.empty()) mBounds.push_back(FrameBounds(frame, inverseBase));
         }
         mFrameCount += frameCount;
     }
@@ -955,12 +991,16 @@ private:
         // blend indices, blend weights, color, custom). Offsets are relative to the data block.
         ByteWriter vertexData;
         std::vector<iqmvertexarray> arrays;
+        // An animation-only file has no vertices and so no arrays.
+        const bool hasVertices = !mVertices.positions.empty();
         auto beginArray = [&](uint32_t type, uint32_t format, uint32_t size) {
             vertexData.Align(4);
             arrays.push_back({ type, 0, format, size, vertexData.Size() });
         };
-        beginArray(IQM_POSITION, IQM_FLOAT, 3);
-        for (const aiVector3D& p : mVertices.positions) { vertexData.F32(p.x); vertexData.F32(p.y); vertexData.F32(p.z); }
+        if (hasVertices) {
+            beginArray(IQM_POSITION, IQM_FLOAT, 3);
+            for (const aiVector3D& p : mVertices.positions) { vertexData.F32(p.x); vertexData.F32(p.y); vertexData.F32(p.z); }
+        }
         if (mHasTexcoords) {
             beginArray(IQM_TEXCOORD, IQM_FLOAT, 2);
             for (const aiVector2D& t : mVertices.texcoords) { vertexData.F32(t.x); vertexData.F32(t.y); }
@@ -1013,7 +1053,7 @@ private:
 
         header.num_vertexarrays = static_cast<uint32_t>(arrays.size());
         header.num_vertexes = static_cast<uint32_t>(mVertices.positions.size());
-        header.ofs_vertexarrays = out.Size();
+        header.ofs_vertexarrays = arrays.empty() ? 0 : out.Size();
         const uint32_t arraysSize = static_cast<uint32_t>(arrays.size() * sizeof(iqmvertexarray));
         // The data block starts 8-byte aligned after the array records, as in iqm.cpp.
         const uint32_t dataStart = (header.ofs_vertexarrays + arraysSize + 7u) & ~7u;
@@ -1031,9 +1071,11 @@ private:
         header.ofs_adjacency = mAdjacency.empty() ? 0 : out.Size();
         for (const auto& a : mAdjacency) { out.U32(a[0]); out.U32(a[1]); out.U32(a[2]); }
 
-        header.num_joints = static_cast<uint32_t>(mJoints.size());
-        header.ofs_joints = mJoints.empty() ? 0 : out.Size();
-        for (const Joint& joint : mJoints) {
+        // Like iqm.cpp, an animation-only file (no meshes) has poses but no joint table.
+        const bool writeJoints = !mMeshes.empty();
+        header.num_joints = writeJoints ? static_cast<uint32_t>(mJoints.size()) : 0;
+        header.ofs_joints = header.num_joints == 0 ? 0 : out.Size();
+        for (const Joint& joint : writeJoints ? mJoints : std::vector<Joint>()) {
             out.U32(joint.name);
             out.I32(joint.parent);
             const std::array<float, 10> values = ChannelValues(joint.base);

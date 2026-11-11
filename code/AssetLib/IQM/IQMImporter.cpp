@@ -49,8 +49,12 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <assimp/DefaultLogger.hpp>
 #include <assimp/Importer.hpp>
 #include <assimp/ByteSwapper.h>
+#include <algorithm>
+#include <cstring>
 #include <memory>
 #include <numeric>
+#include <string>
+#include <vector>
 
 #include "IQMImporter.h"
 #include "iqm.h"
@@ -115,8 +119,57 @@ const aiImporterDesc *IQMImporter::GetInfo() const {
 }
 
 // ------------------------------------------------------------------------------------------------
+//  Helpers for the skeleton, skin and animation import (added with the IQM exporter; the mesh
+//  import below is the original code with bounds checks added).
+namespace {
+
+/// Throws unless @p count elements of @p elementSize bytes at @p offset lie inside the file.
+void CheckRange(size_t fileSize, size_t offset, size_t count, size_t elementSize, const char *what) {
+    if (count == 0) {
+        return;
+    }
+    if (offset > fileSize || elementSize == 0 || count > (fileSize - offset) / elementSize) {
+        throw DeadlyImportError("IQM: ", what, " lie outside the file.");
+    }
+}
+
+/// A string from the text section, or "" when the offset or its terminator is outside it.
+std::string TextAt(const unsigned char *data, const iqmheader &hdr, unsigned int offset) {
+    if (offset >= hdr.num_text) {
+        return std::string();
+    }
+    const char *begin = reinterpret_cast<const char *>(data + hdr.ofs_text + offset);
+    const char *end = static_cast<const char *>(memchr(begin, '\0', hdr.num_text - offset));
+    return end != nullptr ? std::string(begin, end) : std::string();
+}
+
+/// IQM transforms are translate * rotate * scale, rotation stored x, y, z, w.
+aiMatrix4x4 ComposeJoint(const float *translate, const float *rotate, const float *scale) {
+    aiQuaternion rotation(rotate[3], rotate[0], rotate[1], rotate[2]);
+    rotation.Normalize();
+    return aiMatrix4x4(aiVector3D(scale[0], scale[1], scale[2]), rotation,
+            aiVector3D(translate[0], translate[1], translate[2]));
+}
+
+/// Gives @p node the children in @p children (ownership moves to the node).
+void AttachChildren(aiNode *node, const std::vector<aiNode *> &children) {
+    if (children.empty()) {
+        return;
+    }
+    node->mNumChildren = static_cast<unsigned int>(children.size());
+    node->mChildren = new aiNode *[children.size()];
+    std::copy(children.begin(), children.end(), node->mChildren);
+    for (aiNode *child : children) {
+        child->mParent = node;
+    }
+}
+
+} // namespace
+
+// ------------------------------------------------------------------------------------------------
 //  Model 3D import implementation
 void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSystem *pIOHandler) {
+    mPosesSwapped = false; // The importer may be reused for another file.
     // Read file into memory
     std::unique_ptr<IOStream> pStream(pIOHandler->Open(file, "rb"));
     if (!pStream) {
@@ -145,6 +198,18 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
         throw DeadlyImportError("Bad binary header in file ", file, ".");
     }
 
+    // Every section is read in place, so check that each lies inside the file first.
+    CheckRange(fileSize, hdr.ofs_text, hdr.num_text, 1, "text");
+    CheckRange(fileSize, hdr.ofs_meshes, hdr.num_meshes, sizeof(iqmmesh), "meshes");
+    CheckRange(fileSize, hdr.ofs_vertexarrays, hdr.num_vertexarrays, sizeof(iqmvertexarray), "vertex arrays");
+    CheckRange(fileSize, hdr.ofs_triangles, hdr.num_triangles, sizeof(iqmtriangle), "triangles");
+    CheckRange(fileSize, hdr.ofs_joints, hdr.num_joints, sizeof(iqmjoint), "joints");
+    CheckRange(fileSize, hdr.ofs_poses, hdr.num_poses, sizeof(iqmpose), "poses");
+    CheckRange(fileSize, hdr.ofs_anims, hdr.num_anims, sizeof(iqmanim), "animations");
+    if (hdr.num_framechannels != 0) {
+        CheckRange(fileSize, hdr.ofs_frames, static_cast<size_t>(hdr.num_frames) * hdr.num_framechannels, sizeof(uint16_t), "frames");
+    }
+
     ASSIMP_LOG_DEBUG("IQM: loading ", file);
 
     // create the root node
@@ -161,6 +226,45 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
 
     mScene = pScene;
 
+    // Joints become nodes under the root, next to the meshes, so a joint's global transform
+    // relative to the root is its bind pose in the same space as the vertices. An animation-only
+    // file has poses but no joints; it gets nodes "pose<n>" with identity transforms instead, so
+    // its channels have nodes to target.
+    if (hdr.num_joints == 0 && hdr.num_poses > 0) {
+        ReadPoseNodes(data, hdr);
+    }
+    std::vector<std::string> jointNames(hdr.num_joints);
+    std::vector<aiMatrix4x4> jointGlobals(hdr.num_joints);
+    {
+        auto joints = reinterpret_cast<iqmjoint *>(data + hdr.ofs_joints);
+        std::vector<aiNode *> nodes(hdr.num_joints);
+        std::vector<std::vector<aiNode *>> children(hdr.num_joints);
+        std::vector<aiNode *> rootChildren;
+        for (unsigned int i = 0; i < hdr.num_joints; ++i) {
+            iqmjoint &joint = joints[i];
+            swap_block(reinterpret_cast<uint32_t *>(&joint), sizeof(iqmjoint));
+            // IQM lists parents before their children; anything else is not a tree.
+            if (joint.parent >= static_cast<int>(i)) {
+                // None of the nodes made so far is attached yet, so each is deleted on its own.
+                for (unsigned int made = 0; made < i; ++made) delete nodes[made];
+                throw DeadlyImportError("IQM: joint ", i, " has parent ", joint.parent, ", which does not precede it.");
+            }
+            jointNames[i] = TextAt(data, hdr, joint.name);
+            if (jointNames[i].empty()) {
+                jointNames[i] = "joint" + std::to_string(i);
+            }
+            const aiMatrix4x4 local = ComposeJoint(joint.translate, joint.rotate, joint.scale);
+            jointGlobals[i] = joint.parent >= 0 ? jointGlobals[joint.parent] * local : local;
+            nodes[i] = new aiNode(jointNames[i]);
+            nodes[i]->mTransformation = local;
+            (joint.parent >= 0 ? children[joint.parent] : rootChildren).push_back(nodes[i]);
+        }
+        for (unsigned int i = 0; i < hdr.num_joints; ++i) {
+            AttachChildren(nodes[i], children[i]);
+        }
+        AttachChildren(pScene->mRootNode, rootChildren);
+    }
+
     // Allocate output storage
     pScene->mNumMeshes = 0;
     pScene->mMeshes = new aiMesh *[hdr.num_meshes](); // Set arrays to zero to ensue proper destruction if an exception is raised
@@ -172,20 +276,31 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
     for( auto array = reinterpret_cast<iqmvertexarray*>( data + hdr.ofs_vertexarrays ), end = array + hdr.num_vertexarrays; array != end; ++array )
     {
         swap_block( &array->type, sizeof( iqmvertexarray ) );
+        // Sizes of the formats the reader below understands; others are skipped, not read.
+        const size_t componentSize = array->format == IQM_FLOAT ? 4 : array->format == IQM_UBYTE ? 1 : 0;
+        if (componentSize != 0) {
+            CheckRange(fileSize, array->offset, static_cast<size_t>(hdr.num_vertexes) * array->size, componentSize, "vertex data");
+        }
     }
+    // Triangles are swapped per mesh below, so swap them all once here instead (meshes may share ranges).
+    swap_block(reinterpret_cast<uint32_t *>(data + hdr.ofs_triangles), static_cast<size_t>(hdr.num_triangles) * sizeof(iqmtriangle));
 
     // Read all surfaces from the file
     for( auto imesh = reinterpret_cast<iqmmesh*>( data + hdr.ofs_meshes ), end_ = imesh + hdr.num_meshes; imesh != end_; ++imesh )
     {
         swap_block( &imesh->name, sizeof( iqmmesh ) );
+        if (imesh->first_vertex > hdr.num_vertexes || imesh->num_vertexes > hdr.num_vertexes - imesh->first_vertex
+                || imesh->first_triangle > hdr.num_triangles || imesh->num_triangles > hdr.num_triangles - imesh->first_triangle) {
+            throw DeadlyImportError("IQM: a mesh's vertex or triangle range lies outside the file's arrays.");
+        }
         // Allocate output mesh & material
         auto mesh = pScene->mMeshes[pScene->mNumMeshes++] = new aiMesh();
+        mesh->mName = TextAt(data, hdr, imesh->name);
         mesh->mMaterialIndex = pScene->mNumMaterials;
         auto mat = pScene->mMaterials[pScene->mNumMaterials++] = new aiMaterial();
 
         {
-            auto text = reinterpret_cast<char*>( data + hdr.ofs_text );
-            aiString name( text + imesh->material );
+            aiString name( TextAt(data, hdr, imesh->material) );
             mat->AddProperty( &name, AI_MATKEY_NAME );
             mat->AddProperty( &name, AI_MATKEY_TEXTURE_DIFFUSE(0) );
         }
@@ -198,13 +313,25 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
         // Fill in all triangles
         for( auto tri = reinterpret_cast<iqmtriangle*>( data + hdr.ofs_triangles ) + imesh->first_triangle, end = tri + imesh->num_triangles; tri != end; ++tri )
         {
-            swap_block( tri->vertex, sizeof( tri->vertex ) );
+            for (unsigned int corner : tri->vertex) {
+                if (corner < imesh->first_vertex || corner - imesh->first_vertex >= imesh->num_vertexes) {
+                    throw DeadlyImportError("IQM: a triangle uses a vertex outside its mesh.");
+                }
+            }
             auto& face = mesh->mFaces[mesh->mNumFaces++];
             face.mNumIndices = 3;
             face.mIndices = new unsigned int[3]{ tri->vertex[0] - imesh->first_vertex,
                                                  tri->vertex[2] - imesh->first_vertex,
                                                  tri->vertex[1] - imesh->first_vertex };
         }
+
+        // Blend data, turned into bones after all arrays are read.
+        const unsigned char *blendIndices = nullptr;
+        const unsigned char *blendWeightBytes = nullptr;
+        const float *blendWeightFloats = nullptr;
+        unsigned int blendIndexStep = 0, blendWeightStep = 0;
+        const float *tangentData = nullptr;
+        unsigned int tangentStep = 0;
 
         // Fill in all vertices
         for( auto array = reinterpret_cast<const iqmvertexarray*>( data + hdr.ofs_vertexarrays ), end__ = array + hdr.num_vertexarrays; array != end__; ++array )
@@ -280,22 +407,27 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
                 }
                 break;
             case IQM_TANGENT:
-#if 0
-                if (array->format == IQM_FLOAT && step >= 3)
-                {
-                    auto v = mesh->mTangents = new aiVector3D[nVerts];
-                    for( auto f = reinterpret_cast<const float*>( data + array->offset ) + imesh->first_vertex * step,
-                        end = f + nVerts * step; f != end; f += step, ++v )
-                    {
-                        *v = { AI_BE( f[0] ),
-                               AI_BE( f[1] ),
-                               AI_BE( f[2] ) };
-                    }
+                // Read after the loop: the bitangent needs the normals (the sign is in w).
+                if (array->format == IQM_FLOAT && step >= 4) {
+                    tangentData = reinterpret_cast<const float *>(data + array->offset) + imesh->first_vertex * step;
+                    tangentStep = step;
                 }
-#endif
                 break;
             case IQM_BLENDINDEXES:
+                if (array->format == IQM_UBYTE && step >= 1) {
+                    blendIndices = data + array->offset + imesh->first_vertex * step;
+                    blendIndexStep = step;
+                }
+                break;
             case IQM_BLENDWEIGHTS:
+                if (array->format == IQM_UBYTE && step >= 1) {
+                    blendWeightBytes = data + array->offset + imesh->first_vertex * step;
+                    blendWeightStep = step;
+                } else if (array->format == IQM_FLOAT && step >= 1) {
+                    blendWeightFloats = reinterpret_cast<const float *>(data + array->offset) + imesh->first_vertex * step;
+                    blendWeightStep = step;
+                }
+                break;
             case IQM_CUSTOM:
                 break; // these attributes are not relevant.
 
@@ -303,9 +435,159 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
                 break;
             }
         }
+
+        // Tangents: bitangent = (normal x tangent) * w, the same rule as the glTF2 importer
+        // (IQM and glTF both have V running top to bottom).
+        if (tangentData != nullptr && mesh->mNormals != nullptr && mesh->mNumVertices == imesh->num_vertexes) {
+            mesh->mTangents = new aiVector3D[mesh->mNumVertices];
+            mesh->mBitangents = new aiVector3D[mesh->mNumVertices];
+            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                const float *t = tangentData + v * tangentStep;
+                mesh->mTangents[v] = aiVector3D(AI_BE(t[0]), AI_BE(t[1]), AI_BE(t[2]));
+                mesh->mBitangents[v] = (mesh->mNormals[v] ^ mesh->mTangents[v]) * AI_BE(t[3]);
+            }
+        }
+
+        // Skin: one aiBone per joint, offset = inverse bind pose. Joints without weights get a
+        // bone too, as in the glTF2 importer, so the whole skeleton survives a re-export.
+        const bool hasWeights = blendWeightBytes != nullptr || blendWeightFloats != nullptr;
+        if (blendIndices != nullptr && hasWeights && hdr.num_joints > 0 && mesh->mNumVertices == imesh->num_vertexes) {
+            std::vector<std::vector<aiVertexWeight>> weightsPerJoint(hdr.num_joints);
+            const unsigned int influences = std::min(blendIndexStep, blendWeightStep);
+            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                for (unsigned int k = 0; k < influences; ++k) {
+                    const unsigned int joint = blendIndices[v * blendIndexStep + k];
+                    const float weight = blendWeightBytes != nullptr
+                            ? blendWeightBytes[v * blendWeightStep + k] / 255.0f
+                            : AI_BE(blendWeightFloats[v * blendWeightStep + k]);
+                    if (weight <= 0.0f) {
+                        continue;
+                    }
+                    if (joint >= hdr.num_joints) {
+                        throw DeadlyImportError("IQM: a vertex is weighted to joint ", joint, " of ", hdr.num_joints, ".");
+                    }
+                    weightsPerJoint[joint].emplace_back(v, weight);
+                }
+            }
+            std::vector<aiBone *> bones;
+            for (unsigned int j = 0; j < hdr.num_joints; ++j) {
+                auto bone = new aiBone();
+                bone->mName = jointNames[j];
+                bone->mOffsetMatrix = aiMatrix4x4(jointGlobals[j]).Inverse();
+                bone->mNumWeights = static_cast<unsigned int>(weightsPerJoint[j].size());
+                if (bone->mNumWeights > 0) {
+                    bone->mWeights = new aiVertexWeight[bone->mNumWeights];
+                    std::copy(weightsPerJoint[j].begin(), weightsPerJoint[j].end(), bone->mWeights);
+                }
+                bones.push_back(bone);
+            }
+            if (!bones.empty()) {
+                mesh->mNumBones = static_cast<unsigned int>(bones.size());
+                mesh->mBones = new aiBone *[bones.size()];
+                std::copy(bones.begin(), bones.end(), mesh->mBones);
+            }
+        }
     }
+
+    ReadAnimations(data, hdr, jointNames);
 }
 
+// ------------------------------------------------------------------------------------------------
+//  Nodes for an animation-only file, built from the pose parents. Swaps the poses in place, so
+//  ReadAnimations must not swap them again (it checks mPosesSwapped).
+void IQMImporter::ReadPoseNodes(unsigned char *data, const iqmheader &hdr) {
+    auto poses = reinterpret_cast<iqmpose *>(data + hdr.ofs_poses);
+    std::vector<aiNode *> nodes(hdr.num_poses);
+    std::vector<std::vector<aiNode *>> children(hdr.num_poses);
+    std::vector<aiNode *> rootChildren;
+    for (unsigned int i = 0; i < hdr.num_poses; ++i) {
+        swap_block(reinterpret_cast<uint32_t *>(&poses[i]), sizeof(iqmpose));
+        if (poses[i].parent >= static_cast<int>(i)) {
+            for (unsigned int made = 0; made < i; ++made) delete nodes[made];
+            throw DeadlyImportError("IQM: pose ", i, " has parent ", poses[i].parent, ", which does not precede it.");
+        }
+        nodes[i] = new aiNode("pose" + std::to_string(i));
+        (poses[i].parent >= 0 ? children[poses[i].parent] : rootChildren).push_back(nodes[i]);
+    }
+    for (unsigned int i = 0; i < hdr.num_poses; ++i) {
+        AttachChildren(nodes[i], children[i]);
+    }
+    AttachChildren(mScene->mRootNode, rootChildren);
+    mPosesSwapped = true;
+}
+
+// ------------------------------------------------------------------------------------------------
+//  Animations: one aiAnimation per IQM anim, one channel per pose with a key at every frame.
+//  Ticks are frames: mTicksPerSecond is the anim's frame rate, mDuration its last frame.
+void IQMImporter::ReadAnimations(unsigned char *data, const iqmheader &hdr, const std::vector<std::string> &jointNames) {
+    if (hdr.num_anims == 0 || hdr.num_poses == 0) {
+        return;
+    }
+    auto poses = reinterpret_cast<iqmpose *>(data + hdr.ofs_poses);
+    unsigned int channelsPerFrame = 0;
+    for (unsigned int p = 0; p < hdr.num_poses; ++p) {
+        if (!mPosesSwapped) {
+            swap_block(reinterpret_cast<uint32_t *>(&poses[p]), sizeof(iqmpose));
+        }
+        for (unsigned int k = 0; k < 10; ++k) {
+            channelsPerFrame += (poses[p].mask >> k) & 1u;
+        }
+    }
+    if (channelsPerFrame != hdr.num_framechannels) {
+        throw DeadlyImportError("IQM: the pose masks give ", channelsPerFrame, " channels per frame, the header ", hdr.num_framechannels, ".");
+    }
+    auto frames = reinterpret_cast<uint16_t *>(data + hdr.ofs_frames);
+    for (size_t i = 0, count = static_cast<size_t>(hdr.num_frames) * hdr.num_framechannels; i < count; ++i) {
+        AI_SWAP2(frames[i]);
+    }
+
+    auto anims = reinterpret_cast<iqmanim *>(data + hdr.ofs_anims);
+    mScene->mAnimations = new aiAnimation *[hdr.num_anims]();
+    for (unsigned int a = 0; a < hdr.num_anims; ++a) {
+        iqmanim &record = anims[a];
+        swap_block(reinterpret_cast<uint32_t *>(&record), sizeof(iqmanim));
+        if (record.first_frame > hdr.num_frames || record.num_frames > hdr.num_frames - record.first_frame) {
+            throw DeadlyImportError("IQM: animation ", a, " uses frames outside the file's frames.");
+        }
+        auto animation = mScene->mAnimations[mScene->mNumAnimations++] = new aiAnimation();
+        animation->mName = TextAt(data, hdr, record.name);
+        animation->mTicksPerSecond = record.framerate > 0.0f ? record.framerate : 0.0;
+        animation->mDuration = record.num_frames > 1 ? record.num_frames - 1 : 0;
+        if (record.num_frames == 0) {
+            continue;
+        }
+        animation->mNumChannels = hdr.num_poses;
+        animation->mChannels = new aiNodeAnim *[hdr.num_poses]();
+        for (unsigned int p = 0; p < hdr.num_poses; ++p) {
+            auto channel = animation->mChannels[p] = new aiNodeAnim();
+            channel->mNodeName = p < jointNames.size() ? jointNames[p] : "pose" + std::to_string(p);
+            channel->mNumPositionKeys = channel->mNumRotationKeys = channel->mNumScalingKeys = record.num_frames;
+            channel->mPositionKeys = new aiVectorKey[record.num_frames];
+            channel->mRotationKeys = new aiQuatKey[record.num_frames];
+            channel->mScalingKeys = new aiVectorKey[record.num_frames];
+        }
+        for (unsigned int f = 0; f < record.num_frames; ++f) {
+            const uint16_t *values = frames + static_cast<size_t>(record.first_frame + f) * hdr.num_framechannels;
+            for (unsigned int p = 0; p < hdr.num_poses; ++p) {
+                const iqmpose &pose = poses[p];
+                float channels[10];
+                for (unsigned int k = 0; k < 10; ++k) {
+                    channels[k] = pose.channeloffset[k];
+                    if ((pose.mask >> k) & 1u) {
+                        channels[k] += *values++ * pose.channelscale[k];
+                    }
+                }
+                aiNodeAnim *channel = animation->mChannels[p];
+                const double time = f;
+                aiQuaternion rotation(channels[6], channels[3], channels[4], channels[5]);
+                rotation.Normalize();
+                channel->mPositionKeys[f] = aiVectorKey(time, aiVector3D(channels[0], channels[1], channels[2]));
+                channel->mRotationKeys[f] = aiQuatKey(time, rotation);
+                channel->mScalingKeys[f] = aiVectorKey(time, aiVector3D(channels[7], channels[8], channels[9]));
+            }
+        }
+    }
+}
 
 // ------------------------------------------------------------------------------------------------
 
