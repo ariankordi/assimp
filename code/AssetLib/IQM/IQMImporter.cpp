@@ -133,6 +133,40 @@ void CheckRange(size_t fileSize, size_t offset, size_t count, size_t elementSize
     }
 }
 
+constexpr size_t cMaxAnimationKeys = size_t(1) << 26;   ///< Poses x frames over all animations (~5 GB of keys).
+constexpr size_t cMaxPaddedBones = size_t(1) << 20;     ///< Meshes x joints before weightless bones are left out.
+
+/// Rejects files whose sections overlap the header or each other (sections are byte-swapped in
+/// place on big-endian hosts, so an overlap could change values after they were validated), or
+/// whose sections are not 4-byte aligned as iqm.txt requires (they are read in place as structs).
+void CheckSectionLayout(const iqmheader &hdr) {
+    struct Section { size_t begin, end; };
+    std::vector<Section> sections;
+    auto add = [&](size_t offset, size_t count, size_t size) {
+        if (count == 0) return;
+        if (size > 1 && offset % 4 != 0) {
+            throw DeadlyImportError("IQM: a section is not 4-byte aligned.");
+        }
+        sections.push_back({ offset, offset + count * size });
+    };
+    add(hdr.ofs_text, hdr.num_text, 1);
+    add(hdr.ofs_meshes, hdr.num_meshes, sizeof(iqmmesh));
+    add(hdr.ofs_vertexarrays, hdr.num_vertexarrays, sizeof(iqmvertexarray));
+    add(hdr.ofs_triangles, hdr.num_triangles, sizeof(iqmtriangle));
+    add(hdr.ofs_joints, hdr.num_joints, sizeof(iqmjoint));
+    add(hdr.ofs_poses, hdr.num_poses, sizeof(iqmpose));
+    add(hdr.ofs_anims, hdr.num_anims, sizeof(iqmanim));
+    add(hdr.ofs_frames, static_cast<size_t>(hdr.num_frames) * hdr.num_framechannels, sizeof(uint16_t));
+    std::sort(sections.begin(), sections.end(), [](const Section &a, const Section &b) { return a.begin < b.begin; });
+    size_t previousEnd = sizeof(iqmheader);
+    for (const Section &section : sections) {
+        if (section.begin < previousEnd) {
+            throw DeadlyImportError("IQM: file sections overlap each other or the header.");
+        }
+        previousEnd = section.end;
+    }
+}
+
 /// A string from the text section, or "" when the offset or its terminator is outside it.
 std::string TextAt(const unsigned char *data, const iqmheader &hdr, unsigned int offset) {
     if (offset >= hdr.num_text) {
@@ -188,7 +222,9 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
     }
 
     // get header
-    iqmheader &hdr = reinterpret_cast<iqmheader&>( *data );
+    // A copy, not a reference into the buffer: in-place swaps of other sections must not reach it.
+    iqmheader hdr;
+    memcpy(&hdr, data, sizeof(hdr));
     swap_block( &hdr.version, sizeof( iqmheader ) - sizeof( iqmheader::magic ) );
 
     // extra check for header
@@ -209,6 +245,7 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
     if (hdr.num_framechannels != 0) {
         CheckRange(fileSize, hdr.ofs_frames, static_cast<size_t>(hdr.num_frames) * hdr.num_framechannels, sizeof(uint16_t), "frames");
     }
+    CheckSectionLayout(hdr);
 
     ASSIMP_LOG_DEBUG("IQM: loading ", file);
 
@@ -278,6 +315,9 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
         swap_block( &array->type, sizeof( iqmvertexarray ) );
         // Sizes of the formats the reader below understands; others are skipped, not read.
         const size_t componentSize = array->format == IQM_FLOAT ? 4 : array->format == IQM_UBYTE ? 1 : 0;
+        if (componentSize == 4 && array->offset % 4 != 0) {
+            throw DeadlyImportError("IQM: a float vertex array is not 4-byte aligned.");
+        }
         if (componentSize != 0) {
             CheckRange(fileSize, array->offset, static_cast<size_t>(hdr.num_vertexes) * array->size, componentSize, "vertex data");
         }
@@ -451,7 +491,11 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
         // Skin: one aiBone per joint, offset = inverse bind pose. Joints without weights get a
         // bone too, as in the glTF2 importer, so the whole skeleton survives a re-export.
         const bool hasWeights = blendWeightBytes != nullptr || blendWeightFloats != nullptr;
-        if (blendIndices != nullptr && hasWeights && hdr.num_joints > 0 && mesh->mNumVertices == imesh->num_vertexes) {
+        // Weightless bones keep the whole skeleton through a re-export, but cost a bone per joint
+        // per mesh; leave them out when a file asks for an absurd number of those.
+        const bool padBones = static_cast<size_t>(hdr.num_meshes) * hdr.num_joints <= cMaxPaddedBones;
+        if (blendIndices != nullptr && hasWeights && hdr.num_joints > 0 && mesh->mNumVertices > 0
+                && mesh->mNumVertices == imesh->num_vertexes) {
             std::vector<std::vector<aiVertexWeight>> weightsPerJoint(hdr.num_joints);
             const unsigned int influences = std::min(blendIndexStep, blendWeightStep);
             for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
@@ -471,6 +515,9 @@ void IQMImporter::InternReadFile(const std::string &file, aiScene *pScene, IOSys
             }
             std::vector<aiBone *> bones;
             for (unsigned int j = 0; j < hdr.num_joints; ++j) {
+                if (!padBones && weightsPerJoint[j].empty()) {
+                    continue;
+                }
                 auto bone = new aiBone();
                 bone->mName = jointNames[j];
                 bone->mOffsetMatrix = aiMatrix4x4(jointGlobals[j]).Inverse();
@@ -542,6 +589,17 @@ void IQMImporter::ReadAnimations(unsigned char *data, const iqmheader &hdr, cons
     }
 
     auto anims = reinterpret_cast<iqmanim *>(data + hdr.ofs_anims);
+    // Frames with no channels take no file space, so their count is otherwise unbounded:
+    // cap the keys all animations would allocate before allocating any.
+    size_t totalKeys = 0;
+    for (unsigned int a = 0; a < hdr.num_anims; ++a) {
+        uint32_t frameCount = anims[a].num_frames;
+        AI_SWAP4(frameCount);
+        totalKeys += static_cast<size_t>(frameCount) * hdr.num_poses;
+        if (totalKeys > cMaxAnimationKeys) {
+            throw DeadlyImportError("IQM: the animations ask for more than ", cMaxAnimationKeys, " keys.");
+        }
+    }
     mScene->mAnimations = new aiAnimation *[hdr.num_anims]();
     for (unsigned int a = 0; a < hdr.num_anims; ++a) {
         iqmanim &record = anims[a];
