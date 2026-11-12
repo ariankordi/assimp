@@ -699,10 +699,13 @@ SET ( ASSIMP_BUILD_POD_IMPORTER OFF CACHE BOOL
   "Build the PowerVR POD importer, which relies on the PVRAssets loader from the PowerVR Native SDK."
 )
 SET ( PVR_SDK_DIR "" CACHE PATH
-  "Path to a checkout of the PowerVR Native SDK (https://github.com/powervr-graphics/Native_SDK), required by ASSIMP_BUILD_POD_IMPORTER."
+  "Optional path to a checkout of the PowerVR Native SDK (https://github.com/powervr-graphics/Native_SDK) for ASSIMP_BUILD_POD_IMPORTER. If empty, the needed subset is downloaded automatically."
 )
 
 IF (ASSIMP_BUILD_POD_IMPORTER)
+  IF (NOT PVR_SDK_DIR)
+    INCLUDE( FetchPowerVRSDK )
+  ENDIF ()
   IF (NOT EXISTS "${PVR_SDK_DIR}/framework/PVRAssets/fileio/PODReader.cpp")
     MESSAGE( FATAL_ERROR
       "ASSIMP_BUILD_POD_IMPORTER requires PVR_SDK_DIR to point at a PowerVR Native SDK checkout "
