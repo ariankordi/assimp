@@ -321,11 +321,26 @@ void UnifySkinsWithSkeleton(aiScene *scene, const std::string &skinRoot) {
 //   each skin's offset (inverse bind) matrix O -> Rot(H_i) * O
 // Scale keys are left alone: they're only exact for uniform scale, which is all
 // the rigs this is used on have.
-void ResetJointRotations(aiScene *scene, const std::string &rootName) {
+//
+// With alignToModel, the target orientation is the model's own axes instead of
+// <root>'s parent's (--align-joints-to-model). The H_i are then measured from the
+// model root, but <root>'s own mapping still uses identity for its parent, since
+// <root>'s real parent keeps its rotation: <root>'s new rest rotation becomes the
+// inverse of its parent's model-space rotation, so its model-space frame is identity.
+void ResetJointRotations(aiScene *scene, const std::string &rootName, bool alignToModel) {
+    const char *option = alignToModel ? "--align-joints-to-model" : "--reset-joint-rotations";
     aiNode *root = scene->mRootNode->FindNode(rootName.c_str());
     if (root == nullptr) {
-        std::fprintf(stderr, "warning: --reset-joint-rotations '%s' is not a node in the model; ignored\n", rootName.c_str());
+        std::fprintf(stderr, "warning: %s '%s' is not a node in the model; ignored\n", option, rootName.c_str());
         return;
+    }
+
+    // The frame the subtree is measured from: identity (<root>'s parent) or the
+    // model-space rotation of <root>'s parent.
+    aiQuaternion base;
+    if (alignToModel && root->mParent != nullptr) {
+        aiVector3D baseScaling, basePosition;
+        GlobalTransform(root->mParent).Decompose(baseScaling, base, basePosition);
     }
 
     // First pass, on the untouched rest pose: each subtree node's H and its parent's H.
@@ -335,7 +350,7 @@ void ResetJointRotations(aiScene *scene, const std::string &rootName) {
     };
     std::map<std::string, Frames> frames;
     std::vector<aiNode *> order;
-    std::vector<std::pair<aiNode *, aiQuaternion>> stack{{root, aiQuaternion()}};
+    std::vector<std::pair<aiNode *, aiQuaternion>> stack{{root, base}};
     while (!stack.empty()) {
         auto [node, parentFrame] = stack.back();
         stack.pop_back();
@@ -347,14 +362,22 @@ void ResetJointRotations(aiScene *scene, const std::string &rootName) {
         order.push_back(node);
         for (unsigned int i = 0; i < node->mNumChildren; ++i) stack.push_back({node->mChildren[i], own});
     }
+    // <root>'s parent stays as it is, so <root>'s mapping uses identity for it.
+    frames[root->mName.C_Str()].parent = aiQuaternion();
 
-    // Rest pose: rotation becomes identity, translation moves into the parent's new frame.
+    // Rest pose, the same mapping as the keys below: the rotation becomes identity
+    // (with alignToModel, <root>'s becomes the inverse of its parent's model-space
+    // rotation), and the translation moves into the parent's new frame.
     for (aiNode *node : order) {
         const Frames &f = frames[node->mName.C_Str()];
         aiVector3D scaling, position;
         aiQuaternion rotation;
         node->mTransformation.Decompose(scaling, rotation, position);
-        node->mTransformation = aiMatrix4x4(scaling, aiQuaternion(), f.parent.Rotate(position));
+        aiQuaternion ownInverse = f.own;
+        ownInverse.Conjugate();
+        aiQuaternion restRotation = f.parent * rotation * ownInverse;
+        restRotation.Normalize();
+        node->mTransformation = aiMatrix4x4(scaling, restRotation, f.parent.Rotate(position));
     }
 
     // Animation keys, the same mapping per key.
@@ -528,6 +551,10 @@ void PrintUsage(const char *argv0) {
             "                    orientation of <bone>'s parent in the bind pose, rewriting\n"
             "                    rest pose, animation keys and inverse bind matrices so the\n"
             "                    result looks and moves the same.\n"
+            "  --align-joints-to-model <bone>\n"
+            "                    Like --reset-joint-rotations, but the bind orientation\n"
+            "                    becomes the model's own axes (e.g. a head bone that a\n"
+            "                    renderer attaches a head to). Applied after it.\n"
             "  --name-anims-from-file\n"
             "                    Rename each merged animation after its anim-file's\n"
             "                    basename (e.g. animActionBlowOff.Anim.pod -> \n"
@@ -601,6 +628,7 @@ int main(int argc, char **argv) {
     bool unifySkins = false;
     std::string skinRoot;
     std::string resetRotationsRoot;
+    std::string alignToModelRoot;
     bool nameAnimsFromFile = false;
     std::vector<std::string> meshOrder;
     double scale = 1.0;
@@ -649,6 +677,8 @@ int main(int argc, char **argv) {
             unifySkins = true;
         } else if (std::strcmp(argv[i], "--reset-joint-rotations") == 0 && i + 1 < argc) {
             resetRotationsRoot = argv[++i];
+        } else if (std::strcmp(argv[i], "--align-joints-to-model") == 0 && i + 1 < argc) {
+            alignToModelRoot = argv[++i];
         } else if (std::strcmp(argv[i], "--name-anims-from-file") == 0) {
             nameAnimsFromFile = true;
         } else if (std::strcmp(argv[i], "--mesh-order") == 0 && i + 1 < argc) {
@@ -810,7 +840,8 @@ int main(int argc, char **argv) {
     std::copy(merged.begin(), merged.end(), modelScene->mAnimations);
     modelScene->mNumAnimations = static_cast<unsigned int>(merged.size());
 
-    if (!resetRotationsRoot.empty()) ResetJointRotations(modelScene, resetRotationsRoot);
+    if (!resetRotationsRoot.empty()) ResetJointRotations(modelScene, resetRotationsRoot, false);
+    if (!alignToModelRoot.empty()) ResetJointRotations(modelScene, alignToModelRoot, true);
     if (!meshOrder.empty()) ReorderMeshes(modelScene, meshOrder);
     if (unifySkins) UnifySkinsWithSkeleton(modelScene, skinRoot);
     if (sortBonesTopologically) SortBonesTopologically(modelScene);
