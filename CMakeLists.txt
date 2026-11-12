@@ -699,12 +699,13 @@ SET ( ASSIMP_BUILD_POD_IMPORTER OFF CACHE BOOL
   "Build the PowerVR POD importer, which relies on the PVRAssets loader from the PowerVR Native SDK."
 )
 SET ( PVR_SDK_DIR "" CACHE PATH
-  "Optional path to a checkout of the PowerVR Native SDK (https://github.com/powervr-graphics/Native_SDK) for ASSIMP_BUILD_POD_IMPORTER. If empty, the needed subset is downloaded automatically."
+  "Optional path to a checkout (or symlink) of the PowerVR Native SDK (https://github.com/powervr-graphics/Native_SDK) for ASSIMP_BUILD_POD_IMPORTER. If empty, the subset vendored in contrib/powervr is used."
 )
 
 IF (ASSIMP_BUILD_POD_IMPORTER)
   IF (NOT PVR_SDK_DIR)
-    INCLUDE( FetchPowerVRSDK )
+    # Default to the vendored subset, which mirrors the SDK's directory layout.
+    SET( PVR_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/contrib/powervr" )
   ENDIF ()
   IF (NOT EXISTS "${PVR_SDK_DIR}/framework/PVRAssets/fileio/PODReader.cpp")
     MESSAGE( FATAL_ERROR
