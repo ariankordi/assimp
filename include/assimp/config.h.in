@@ -932,6 +932,27 @@ enum aiComponent
     "IMPORT_MD5_NO_ANIM_AUTOLOAD"
 
 // ---------------------------------------------------------------------------
+/** @brief Selects how the POD importer interprets stored node rotation
+ *  quaternions.
+ *
+ * POD files exist in two incompatible conventions. Files written by
+ * Imagination's own exporters (PVRGeoPOD and its DCC plugins, identified by
+ * their FileHistory/ExportOptions blocks) expect the PowerVR SDK's OpenGL
+ * path, which renders the conjugate of the stored quaternion. Some
+ * third-party pipelines that write POD through the SDK's SavePOD (e.g.
+ * Miitomo's .Mdl.pod files, which carry no history block) store the
+ * rotation itself. Baked-matrix animation is unaffected by this setting.
+ *
+ * * -1: auto-detect from the file's history/export-options blocks (default).
+ * *  0: always use the SDK (conjugate) convention.
+ * *  1: always use the stored quaternion as-is.
+ *
+ * * Property type: integer. Default value: -1.
+ */
+#define AI_CONFIG_IMPORT_POD_QUATERNION_CONVENTION      \
+    "IMPORT_POD_QUATERNION_CONVENTION"
+
+// ---------------------------------------------------------------------------
 /** @brief Defines the begin of the time range for which the LWS loader
  *    evaluates animations and computes aiNodeAnim's.
  *

@@ -51,6 +51,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <assimp/BaseImporter.h>
 
+#include <cstdint>
+#include <string>
 #include <vector>
 
 struct aiNode;
@@ -63,11 +65,48 @@ class Model;
 
 namespace Assimp {
 
+/// How a POD file's stored node rotation quaternions are to be interpreted.
+enum class PODQuaternionConvention {
+    /// Imagination's exporters (PVRGeoPOD and its DCC plugins): the PowerVR
+    /// SDK's OpenGL path renders the *conjugate* of the stored quaternion.
+    Sdk,
+    /// Stored quaternion is the rotation itself (seen in third-party
+    /// pipelines that write POD via the SDK's SavePOD, e.g. Miitomo's .Mdl.pod).
+    Raw
+};
+
+/// Per-node transform data exactly as stored in a POD file. PVRAssets'
+/// PODReader discards the per-node animation flags and index arrays (and
+/// matrix-node rest transforms), so the importer re-reads node blocks itself.
+struct PODRawNode {
+    std::string name; ///< Node name, used to cross-check node order against PVRAssets.
+    uint32_t animFlags = 0; ///< Bitmask: 1 position, 2 rotation, 4 scale, 8 matrix.
+    std::vector<float> position; ///< 3 floats per key.
+    std::vector<float> rotation; ///< 4 floats (x, y, z, w) per key.
+    std::vector<float> scale; ///< 7 floats per key (3 used), or 3 for the old format.
+    std::vector<float> matrix; ///< 16 floats per key (row-vector layout).
+    std::vector<uint32_t> positionIdx; ///< Optional per-frame float offsets into position.
+    std::vector<uint32_t> rotationIdx; ///< Optional per-frame float offsets into rotation.
+    std::vector<uint32_t> scaleIdx; ///< Optional per-frame float offsets into scale.
+    std::vector<uint32_t> matrixIdx; ///< Optional per-frame float offsets into matrix.
+};
+
+/// File-level information gathered by the raw tag scan.
+struct PODRawInfo {
+    std::string exportOptions; ///< ExportOptions block (written by Imagination exporters).
+    std::string history; ///< FileHistory block, e.g. "PVRGeoPOD x64 2.28 | 21.2@6162260".
+    uint32_t numFrames = 0; ///< Scene frame count (0 = static).
+    std::vector<PODRawNode> nodes; ///< Nodes in file order (same order as PVRAssets' nodes).
+};
+
 /// Importer for PowerVR POD mesh, skeleton and animation data.
 class PODImporter : public BaseImporter {
 public:
     /// BaseImporter override.
     bool CanRead(const std::string &pFile, IOSystem *pIOHandler, bool checkSig) const override;
+
+    /// BaseImporter override; reads AI_CONFIG_IMPORT_POD_QUATERNION_CONVENTION.
+    void SetupProperties(const Importer *pImp) override;
 
 protected:
     /// BaseImporter override.
@@ -77,13 +116,19 @@ protected:
     const aiImporterDesc *GetInfo() const override;
 
 private:
-    void BuildNodes(pvr::assets::Model &model, aiScene *pScene);
+    void BuildNodes(pvr::assets::Model &model, const PODRawInfo &raw, aiScene *pScene);
     void BuildMeshesAndMaterials(pvr::assets::Model &model, aiScene *pScene);
-    void BuildAnimations(pvr::assets::Model &model, aiScene *pScene);
+    void BuildAnimations(pvr::assets::Model &model, const PODRawInfo &raw, aiScene *pScene);
 
     /// Maps a POD node index to the aiNode created for it; populated by BuildNodes
     /// and consumed by BuildMeshesAndMaterials (bone nodes) and BuildAnimations.
     std::vector<aiNode *> mNodesByIndex;
+
+    /// Configured convention override: -1 auto-detect, 0 SDK, 1 raw.
+    int mConventionSetting = -1;
+
+    /// Convention in effect for the file being imported.
+    PODQuaternionConvention mConvention = PODQuaternionConvention::Sdk;
 };
 
 } // namespace Assimp

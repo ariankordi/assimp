@@ -70,10 +70,15 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <unordered_map>
 
 #include "PVRAssets/Model.h"
+#include "PVRAssets/fileio/PODDefines.h"
 #include "PVRAssets/fileio/PODReader.h"
 #include "PVRCore/stream/BufferStream.h"
 
-#include <glm/gtx/matrix_decompose.hpp>
+#include <assimp/Importer.hpp>
+#include <assimp/config.h>
+
+#include <cstring>
+#include <optional>
 
 using namespace pvr;
 using namespace pvr::assets;
@@ -163,39 +168,257 @@ uint32_t ReadFaceIndex(const uint8_t *data, IndexType type, uint32_t i) {
     return reinterpret_cast<const uint16_t *>(data)[i];
 }
 
-// PODReader.cpp negates the rotation quaternion's w component while
-// parsing both static node rotations and animation keyframes (it does
-// this unconditionally, regardless of the authoring SDK version). That
-// negation reverses rotation direction and, empirically, produces a
-// skeleton reflected top-to-bottom for a file authored with
-// SDK 3.5: composing the raw node hierarchy with PVRAssets' own
-// getWorldMatrix()/constructSRT() puts e.g. Spine_2 *below* Waist
-// instead of above it. Negating w back here undoes PODReader's
-// negation and reproduces the expected bind pose.
-aiQuaternion ToAiQuaternion(const glm::quat &q) {
-    return {-q.w, q.x, q.y, q.z};
+// ---------------------------------------------------------------------------
+// Raw node transform scan and evaluation.
+//
+// PVRAssets' PODReader (v5.x) is not used for node transforms or animation:
+// it stores every node's animation flags and index arrays into one shared,
+// model-wide AnimationData (so they are effectively discarded), treats index-
+// compressed key arrays as one key per frame, never builds a rest transform
+// for matrix-animated nodes, and bakes its own quaternion sign convention into
+// what it returns. Instead, node blocks are re-read here and evaluated with
+// the semantics of the PowerVR SDK 3.5 runtime, CPVRTModelPOD::SetFrame /
+// GetScalingMatrix / GetRotationMatrix / GetTranslationMatrix /
+// GetTransformationMatrix / GetWorldMatrixNoCache in Tools/PVRTModelPOD.cpp,
+// tag R15.1-v3.5 of https://github.com/powervr-graphics/Native_SDK
+// (Copyright (c) Imagination Technologies Limited). Only the behaviour is
+// reproduced; no SDK code is copied. Key points of that behaviour:
+//  * a component's per-frame data is consulted only if its nAnimFlags bit
+//    is set; otherwise element 0 is used even if more data exists;
+//  * index arrays hold *float offsets* into the key array, not key numbers;
+//  * scale keys are 7 floats wide (3 used);
+//  * a node with matrix data uses it exclusively, ignoring S/R/T;
+//  * matrices are stored in the SDK's row-vector layout (translation in
+//    elements 12..14);
+//  * frame 0 is the bind pose used for skinning (GetBoneWorldMatrix).
+// Verified numerically against that runtime with the scratch tools in
+// scratch/pod-roundtrip (pod35_dump vs assimp_anim_dump).
+
+/// Node animation flag bits (SDK 3.5 EPODAnimationData).
+constexpr uint32_t cPodHasPositionAni = 0x01;
+constexpr uint32_t cPodHasRotationAni = 0x02;
+constexpr uint32_t cPodHasScaleAni = 0x04;
+constexpr uint32_t cPodHasMatrixAni = 0x08;
+
+/// Floats per key for each node transform array.
+constexpr size_t cPodPositionStride = 3;
+constexpr size_t cPodRotationStride = 4;
+constexpr size_t cPodScaleStride = 7;
+constexpr size_t cPodMatrixStride = 16;
+
+/// Bit set on a tag id to mark the end of the block it opened.
+constexpr uint32_t cPodEndTagBit = pod::c_endTagMask;
+
+/// Read-only view of a byte range (assimp builds as C++17, so no std::span).
+struct ByteView {
+    const uint8_t *data = nullptr; ///< First byte.
+    size_t size = 0;               ///< Number of bytes.
+
+    /// Returns the sub-range [offset, offset + count); caller validates bounds.
+    ByteView Sub(size_t offset, size_t count) const { return { data + offset, count }; }
+};
+
+/// Little-endian 32-bit load from an unaligned position (POD is little-endian).
+uint32_t LoadU32(const uint8_t *p) {
+    uint32_t v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
 }
 
-aiVector3D ToAiVector3D(const glm::vec3 &v) {
-    return {v.x, v.y, v.z};
+/// Copies a tag payload of 32-bit values into a vector (whole elements only).
+template <typename T>
+std::vector<T> LoadArray32(ByteView payload) {
+    static_assert(sizeof(T) == 4);
+    std::vector<T> out(payload.size / 4);
+    if (!out.empty()) std::memcpy(out.data(), payload.data, out.size() * 4);
+    return out;
 }
 
-// For KeyFrameData::mat4 channels (baked per-frame 4x4 matrices), used by
-// e_nodeAnimationMatrix. Unlike the SRT rotation path, PODReader never
-// touches quaternions here -- there's nothing to undo -- so this must NOT
-// apply the -w correction ToAiQuaternion above applies for the SRT path.
-aiQuaternion RawToAiQuaternion(const glm::quat &q) {
-    return {q.w, q.x, q.y, q.z};
+/// Converts a tag payload to a string, dropping trailing NULs.
+std::string LoadString(ByteView payload) {
+    std::string s(reinterpret_cast<const char *>(payload.data), payload.size);
+    while (!s.empty() && s.back() == '\0') s.pop_back();
+    return s;
 }
 
-// Composes a node's bind-pose world transform by walking its aiNode
-// parent chain (all of which were just built from POD's local SRT data,
-// via the corrected ToAiQuaternion above). Used instead of trusting
-// PVRAssets' own precomputed Skeleton::invBindMatrices, because those
-// were baked in at POD-load time using PVRAssets' own (uncorrected)
-// quaternion convention -- mixing them with our corrected node
-// hierarchy would make bone world transform and inverse bind matrix
-// mutually inconsistent, distorting the mesh even in bind pose.
+/// Scans a POD byte stream for file-level history/options and the raw
+/// transform data of every node block, in file order. The tag stream is
+/// flat: every tag (container or data) is (id, length, payload) and each is
+/// closed by (id | end bit, 0); containers simply have a zero length, so
+/// skipping each payload by its length walks the whole file. Every length
+/// is validated against the remaining buffer.
+PODRawInfo ScanRawPod(ByteView file) {
+    PODRawInfo info;
+    PODRawNode *node = nullptr;
+    size_t pos = 0;
+    while (file.size - pos >= 8) {
+        const uint32_t id = LoadU32(file.data + pos);
+        const uint32_t length = LoadU32(file.data + pos + 4);
+        pos += 8;
+        if (length > file.size - pos) {
+            throw DeadlyImportError("POD: tag ", id & ~cPodEndTagBit, " overruns the file");
+        }
+        const ByteView payload = file.Sub(pos, length);
+        pos += length;
+
+        if (id == (static_cast<uint32_t>(pod::e_sceneNode) | cPodEndTagBit)) {
+            node = nullptr;
+            continue;
+        }
+        if (id & cPodEndTagBit) continue;
+
+        switch (id) {
+        case pod::ExportOptions: info.exportOptions = LoadString(payload); break;
+        case pod::FileHistory: info.history = LoadString(payload); break;
+        case pod::e_sceneNumFrames:
+            if (payload.size >= 4) info.numFrames = LoadU32(payload.data);
+            break;
+        case pod::e_sceneNode: node = &info.nodes.emplace_back(); break;
+        default:
+            if (!node) break;
+            switch (id) {
+            case pod::e_nodeName: node->name = LoadString(payload); break;
+            case pod::e_nodeAnimationFlags:
+                if (payload.size >= 4) node->animFlags = LoadU32(payload.data);
+                break;
+            // The deprecated single-value tags share storage with the animated
+            // ones; with no flag bit set only element 0 is ever read.
+            case pod::e_nodePosition:
+            case pod::e_nodeAnimationPosition: node->position = LoadArray32<float>(payload); break;
+            case pod::e_nodeRotation:
+            case pod::e_nodeAnimationRotation: node->rotation = LoadArray32<float>(payload); break;
+            case pod::e_nodeScale:
+            case pod::e_nodeAnimationScale: node->scale = LoadArray32<float>(payload); break;
+            case pod::e_nodeMatrix:
+            case pod::e_nodeAnimationMatrix: node->matrix = LoadArray32<float>(payload); break;
+            case pod::e_nodeAnimationPositionIndex: node->positionIdx = LoadArray32<uint32_t>(payload); break;
+            case pod::e_nodeAnimationRotationIndex: node->rotationIdx = LoadArray32<uint32_t>(payload); break;
+            case pod::e_nodeAnimationScaleIndex: node->scaleIdx = LoadArray32<uint32_t>(payload); break;
+            case pod::e_nodeAnimationMatrixIndex: node->matrixIdx = LoadArray32<uint32_t>(payload); break;
+            default: break;
+            }
+            break;
+        }
+    }
+    return info;
+}
+
+/// Returns the float offset of @p frame's key in one transform array, as the
+/// SDK 3.5 runtime selects it, or std::nullopt when the array is too short.
+std::optional<size_t> KeyOffset(const std::vector<float> &data, const std::vector<uint32_t> &indices,
+        bool animated, uint32_t frame, size_t stride, size_t width) {
+    size_t offset = 0;
+    if (animated) {
+        if (!indices.empty()) {
+            // Index arrays are float offsets, one per frame.
+            offset = indices[std::min<size_t>(frame, indices.size() - 1)];
+        } else {
+            offset = static_cast<size_t>(frame) * stride;
+        }
+    }
+    if (offset > data.size() || data.size() - offset < width) return std::nullopt;
+    return offset;
+}
+
+/// One node's local transform at one frame, in assimp terms.
+struct PODLocalTransform {
+    aiVector3D scaling{ 1.0f, 1.0f, 1.0f };   ///< Per-axis scale.
+    aiQuaternion rotation;                    ///< Rotation (assimp convention).
+    aiVector3D position;                      ///< Translation.
+    std::optional<aiMatrix4x4> matrix;        ///< Set for matrix nodes (S/R/T then hold its decomposition).
+};
+
+/// Converts a stored POD quaternion (x, y, z, w floats) to the rotation it
+/// represents under @p convention.
+aiQuaternion ToAiQuaternion(const float *q, PODQuaternionConvention convention) {
+    if (convention == PODQuaternionConvention::Sdk) {
+        // SDK 3.5 PVRTMatrixRotationQuaternionF (non-DX11 path) fills a row-
+        // vector matrix whose effective rotation is that of the conjugate.
+        return { q[3], -q[0], -q[1], -q[2] };
+    }
+    return { q[3], q[0], q[1], q[2] };
+}
+
+/// Converts 16 floats of a POD (row-vector layout) matrix to an aiMatrix4x4
+/// (column-vector convention): element (row, col) = f[col * 4 + row].
+aiMatrix4x4 ToAiMatrix(const float *f) {
+    return aiMatrix4x4(f[0], f[4], f[8], f[12],
+            f[1], f[5], f[9], f[13],
+            f[2], f[6], f[10], f[14],
+            f[3], f[7], f[11], f[15]);
+}
+
+/// Evaluates a node's local transform at an integer frame with SDK 3.5
+/// semantics. @p warned is set when an out-of-range key had to be replaced
+/// by element 0, so callers can log once per node.
+PODLocalTransform EvaluateLocal(const PODRawNode &node, uint32_t frame, PODQuaternionConvention convention, bool &warned) {
+    PODLocalTransform out;
+    auto offsetOrFirst = [&](const std::vector<float> &data, const std::vector<uint32_t> &idx,
+                                 uint32_t flag, size_t stride, size_t width) -> std::optional<size_t> {
+        if (data.size() < width) return std::nullopt;
+        std::optional<size_t> off = KeyOffset(data, idx, (node.animFlags & flag) != 0, frame, stride, width);
+        if (!off) {
+            warned = true;
+            off = 0;
+        }
+        return off;
+    };
+
+    if (!node.matrix.empty()) {
+        if (const auto off = offsetOrFirst(node.matrix, node.matrixIdx, cPodHasMatrixAni, cPodMatrixStride, cPodMatrixStride)) {
+            out.matrix = ToAiMatrix(node.matrix.data() + *off);
+            out.matrix->Decompose(out.scaling, out.rotation, out.position);
+        } else {
+            out.matrix = aiMatrix4x4();
+        }
+        return out;
+    }
+    if (const auto off = offsetOrFirst(node.scale, node.scaleIdx, cPodHasScaleAni, cPodScaleStride, 3)) {
+        const float *s = node.scale.data() + *off;
+        out.scaling = aiVector3D(s[0], s[1], s[2]);
+    }
+    if (const auto off = offsetOrFirst(node.rotation, node.rotationIdx, cPodHasRotationAni, cPodRotationStride, 4)) {
+        out.rotation = ToAiQuaternion(node.rotation.data() + *off, convention);
+    }
+    if (const auto off = offsetOrFirst(node.position, node.positionIdx, cPodHasPositionAni, cPodPositionStride, 3)) {
+        const float *p = node.position.data() + *off;
+        out.position = aiVector3D(p[0], p[1], p[2]);
+    }
+    return out;
+}
+
+/// Composes a local transform into a matrix (T * R * S for SRT nodes, as the
+/// SDK's GetWorldMatrixNoCache does). Deliberately not
+/// aiMatrix4x4(scaling, rotation, position): that constructor scales the
+/// rotation's *rows* (S * R), which disagrees with aiMatrix4x4::Decompose
+/// (column scale, R * S) whenever the scale is non-uniform.
+aiMatrix4x4 ToMatrix(const PODLocalTransform &t) {
+    if (t.matrix) return *t.matrix;
+    aiMatrix4x4 translation;
+    aiMatrix4x4 scaling;
+    aiMatrix4x4::Translation(t.position, translation);
+    aiMatrix4x4::Scaling(t.scaling, scaling);
+    return translation * aiMatrix4x4(t.rotation.GetMatrix()) * scaling;
+}
+
+/// True if any transform data is stored for the node.
+bool HasTransformData(const PODRawNode &node) {
+    return !node.matrix.empty() || !node.position.empty() || !node.rotation.empty() || !node.scale.empty();
+}
+
+/// Picks the quaternion convention for a file: Imagination's exporters
+/// always write ExportOptions and FileHistory blocks.
+PODQuaternionConvention DetectConvention(const PODRawInfo &raw) {
+    if (!raw.history.empty() || !raw.exportOptions.empty()) return PODQuaternionConvention::Sdk;
+    return PODQuaternionConvention::Raw;
+}
+
+// Composes a node's bind-pose (frame 0) world transform by walking its aiNode
+// parent chain. Used instead of PVRAssets' precomputed
+// Skeleton::invBindMatrices, which are baked with PVRAssets' own quaternion
+// handling and ignore matrix-node rest transforms -- mixing them with this
+// importer's node hierarchy would make bone world transform and inverse bind
+// matrix mutually inconsistent, distorting the mesh even in bind pose.
 aiMatrix4x4 ComputeWorldTransform(const aiNode *node) {
     aiMatrix4x4 world = node->mTransformation;
     for (const aiNode *parent = node->mParent; parent != nullptr; parent = parent->mParent) {
@@ -214,9 +437,12 @@ unsigned int CountDescendants(const aiNode *n) {
 
 } // namespace
 
-void PODImporter::BuildNodes(Model &model, aiScene *pScene) {
+void PODImporter::BuildNodes(Model &model, const PODRawInfo &raw, aiScene *pScene) {
     const uint32_t numNodes = model.getNumNodes();
     mNodesByIndex.assign(numNodes, nullptr);
+    if (raw.nodes.size() != numNodes) {
+        throw DeadlyImportError("POD: raw node scan found ", raw.nodes.size(), " nodes, PVRAssets ", numNodes);
+    }
 
     std::map<std::string, uint32_t> nameUsageCount;
 
@@ -232,15 +458,25 @@ void PODImporter::BuildNodes(Model &model, aiScene *pScene) {
         }
         ++usageCount;
 
+        // Both readers walk node blocks in file order; a name mismatch would
+        // mean the raw scan and PVRAssets disagree about which node is which.
+        if (raw.nodes[i].name != static_cast<const std::string &>(node.getName())) {
+            throw DeadlyImportError("POD: node ", i, " name mismatch between raw scan and PVRAssets");
+        }
+
+        // The rest transform is frame 0, which is also the pose the SDK uses
+        // as the skinning bind pose.
+        bool warned = false;
         aiNode *ainode = new aiNode(name);
-        ainode->mTransformation = aiMatrix4x4(
-                ToAiVector3D(node.getInternalData().getScale()),
-                ToAiQuaternion(node.getInternalData().getRotate()),
-                ToAiVector3D(node.getInternalData().getTranslation()));
+        ainode->mTransformation = ToMatrix(EvaluateLocal(raw.nodes[i], 0, mConvention, warned));
+        if (warned) {
+            ASSIMP_LOG_WARN("POD: node \"", name, "\" has truncated transform data; using its first key");
+        }
         mNodesByIndex[i] = ainode;
     }
 
     std::vector<aiNode *> rootLevelNodes;
+    std::vector<uint32_t> rootLevelIndices; ///< POD node index of each rootLevelNodes entry.
     for (uint32_t i = 0; i < numNodes; ++i) {
         const uint32_t parentIdx = model.getNode(i).getParentID();
         if (parentIdx < numNodes) {
@@ -254,6 +490,7 @@ void PODImporter::BuildNodes(Model &model, aiScene *pScene) {
             mNodesByIndex[i]->mParent = parent;
         } else {
             rootLevelNodes.push_back(mNodesByIndex[i]);
+            rootLevelIndices.push_back(i);
         }
     }
 
@@ -264,10 +501,13 @@ void PODImporter::BuildNodes(Model &model, aiScene *pScene) {
         // sitting alongside a joint hierarchy root), but assimp needs exactly
         // one aiScene::mRootNode. Rather than inventing a new node, reuse
         // whichever existing top-level node has the most descendants (in
-        // practice, the joint hierarchy root) and reparent the rest under it;
-        // its transform is identity in every POD file seen so far, so this is
-        // a purely structural change. Only fabricate a node if every top-level
-        // node is a leaf (no reasonable candidate to reuse).
+        // practice, the joint hierarchy root) and reparent the rest under it
+        // -- but only if that node's transform is identity and never
+        // animated, so the reparenting is purely structural. Otherwise the
+        // reparented siblings would inherit its transform: PVRGeoPOD output,
+        // for example, puts the Z-up -> Y-up rotation on top-level nodes,
+        // which turned every reparented mesh node by 90 degrees. Fabricate a
+        // node only when no top-level node qualifies.
         size_t bestIdx = 0;
         unsigned int bestDescendants = 0;
         for (size_t i = 0; i < rootLevelNodes.size(); ++i) {
@@ -279,7 +519,8 @@ void PODImporter::BuildNodes(Model &model, aiScene *pScene) {
         }
 
         aiNode *root = nullptr;
-        if (bestDescendants > 0) {
+        if (bestDescendants > 0 && rootLevelNodes[bestIdx]->mTransformation.IsIdentity() &&
+                raw.nodes[rootLevelIndices[bestIdx]].animFlags == 0) {
             root = rootLevelNodes[bestIdx];
         } else {
             root = new aiNode("POD_RootNode");
@@ -320,6 +561,22 @@ void PODImporter::BuildMeshesAndMaterials(Model &model, aiScene *pScene) {
     const uint32_t numMeshes = model.getNumMeshes();
     pScene->mNumMeshes = numMeshes;
     pScene->mMeshes = new aiMesh *[numMeshes];
+
+    // Frame-0 world transform of the (first) node instancing each mesh. The
+    // SDK's GetBoneWorldMatrix skins as boneWorld(f) * boneWorld(0)^-1 *
+    // meshNodeWorld(0), so the mesh node's transform belongs in the offset
+    // matrix too. Mesh nodes occupy indices [0, getNumMeshNodes()).
+    std::vector<aiMatrix4x4> meshNodeWorld(numMeshes);
+    {
+        std::vector<bool> seen(numMeshes, false);
+        for (uint32_t i = 0; i < model.getNumMeshNodes() && i < mNodesByIndex.size(); ++i) {
+            const uint32_t meshIndex = model.getMeshNode(i).getObjectId();
+            if (meshIndex < numMeshes && !seen[meshIndex]) {
+                seen[meshIndex] = true;
+                meshNodeWorld[meshIndex] = ComputeWorldTransform(mNodesByIndex[i]);
+            }
+        }
+    }
 
     for (uint32_t m = 0; m < numMeshes; ++m) {
         Mesh &mesh = model.getMesh(m);
@@ -426,8 +683,9 @@ void PODImporter::BuildMeshesAndMaterials(Model &model, aiScene *pScene) {
                 aiBone *bone = new aiBone();
                 const aiNode *boneNode = mNodesByIndex[skeleton.bones[b]];
                 bone->mName = boneNode->mName;
-                bone->mOffsetMatrix = ComputeWorldTransform(boneNode);
-                bone->mOffsetMatrix.Inverse();
+                aiMatrix4x4 boneWorldInverse = ComputeWorldTransform(boneNode);
+                boneWorldInverse.Inverse();
+                bone->mOffsetMatrix = boneWorldInverse * meshNodeWorld[m];
                 bone->mNumWeights = static_cast<unsigned int>(perBone[b].size());
                 bone->mWeights = new aiVertexWeight[perBone[b].size()];
                 std::copy(perBone[b].begin(), perBone[b].end(), bone->mWeights);
@@ -464,133 +722,97 @@ void PODImporter::BuildMeshesAndMaterials(Model &model, aiScene *pScene) {
     }
 }
 
-void PODImporter::BuildAnimations(Model &model, aiScene *pScene) {
-    Model::InternalData &modelData = model.getInternalData();
-    if (modelData.animationsData.empty() || modelData.animationInstances.empty()) {
+void PODImporter::BuildAnimations(Model &model, const PODRawInfo &raw, aiScene *pScene) {
+    // A POD file holds at most one animation: the scene's frame range. Static
+    // files (numFrames == 0, e.g. Miitomo's .Mdl.pod) produce none.
+    const uint32_t numFrames = raw.numFrames;
+    if (numFrames == 0) {
         return;
     }
-
-    AnimationData &animData = modelData.animationsData[0];
-    AnimationData::InternalData &animInternal = animData.getInternalData();
-    AnimationInstance &instance = model.getAnimationInstance(0);
 
     float fps = model.getFPS();
     if (fps <= 0.0f) fps = 30.0f;
 
-    // Map each Node's address (as used by AnimationInstance::KeyframeChannel::nodes)
-    // back to its POD node index, so channels can be attached to the right aiNode.
-    std::unordered_map<const void *, uint32_t> nodePtrToIndex;
-    const uint32_t numNodes = model.getNumNodes();
-    for (uint32_t i = 0; i < numNodes; ++i) {
-        nodePtrToIndex[static_cast<const void *>(&model.getNode(i))] = i;
-    }
+    // One channel per node that stores any transform data -- including nodes
+    // whose transform is constant. Animation-only POD files (e.g. Miitomo's
+    // .Anim.pod) define the pose of every joint, static ones included; if
+    // those got no channel, merging the clip onto a separately-loaded model
+    // would leave them in the model's rest pose instead of the clip's.
+    std::vector<aiNodeAnim *> channels;
+    for (size_t i = 0; i < raw.nodes.size(); ++i) {
+        const PODRawNode &node = raw.nodes[i];
+        if (!HasTransformData(node)) continue;
 
-    struct Channels {
-        std::vector<aiVectorKey> position;
-        std::vector<aiQuatKey> rotation;
-        std::vector<aiVectorKey> scaling;
-    };
-    std::map<uint32_t, Channels> perNode;
-    double maxTicks = 0.0;
+        const bool isMatrix = !node.matrix.empty();
+        const auto keyCount = [&](uint32_t flag) -> uint32_t {
+            return (node.animFlags & flag) != 0 ? numFrames : 1;
+        };
+        const uint32_t positionKeys = keyCount(isMatrix ? cPodHasMatrixAni : cPodHasPositionAni);
+        const uint32_t rotationKeys = keyCount(isMatrix ? cPodHasMatrixAni : cPodHasRotationAni);
+        const uint32_t scalingKeys = keyCount(isMatrix ? cPodHasMatrixAni : cPodHasScaleAni);
+        const uint32_t framesToEvaluate = std::max({ positionKeys, rotationKeys, scalingKeys });
 
-    for (const AnimationInstance::KeyframeChannel &channel : instance.keyframeChannels) {
-        if (channel.keyFrame >= animInternal.keyFrames.size()) continue;
-        const KeyFrameData &kf = animInternal.keyFrames[channel.keyFrame];
+        aiNodeAnim *channel = new aiNodeAnim();
+        channel->mNodeName = mNodesByIndex[i]->mName;
+        channel->mNumPositionKeys = positionKeys;
+        channel->mPositionKeys = new aiVectorKey[positionKeys];
+        channel->mNumRotationKeys = rotationKeys;
+        channel->mRotationKeys = new aiQuatKey[rotationKeys];
+        channel->mNumScalingKeys = scalingKeys;
+        channel->mScalingKeys = new aiVectorKey[scalingKeys];
 
-        for (void *rawNode : channel.nodes) {
-            auto it = nodePtrToIndex.find(rawNode);
-            if (it == nodePtrToIndex.end()) continue;
-            Channels &out = perNode[it->second];
-
-            if (!kf.translation.empty()) {
-                for (size_t k = 0; k < kf.translation.size(); ++k) {
-                    const double t = static_cast<double>(kf.timeInSeconds[k]) * fps;
-                    out.position.emplace_back(t, ToAiVector3D(kf.translation[k]));
-                    maxTicks = std::max(maxTicks, t);
-                }
-            }
-            if (!kf.rotate.empty()) {
-                for (size_t k = 0; k < kf.rotate.size(); ++k) {
-                    const double t = static_cast<double>(kf.timeInSeconds[k]) * fps;
-                    out.rotation.emplace_back(t, ToAiQuaternion(kf.rotate[k]));
-                    maxTicks = std::max(maxTicks, t);
-                }
-            }
-            if (!kf.scale.empty()) {
-                for (size_t k = 0; k < kf.scale.size(); ++k) {
-                    const double t = static_cast<double>(kf.timeInSeconds[k]) * fps;
-                    out.scaling.emplace_back(t, ToAiVector3D(kf.scale[k]));
-                    maxTicks = std::max(maxTicks, t);
-                }
-            }
-            // e_nodeAnimationMatrix channels (Miitomo's real animation POD files
-            // use these, not separate SRT tracks -- confirmed via pod_animdump
-            // against animActionAntigravity.Anim.pod, whose translation/rotate/
-            // scale arrays are all empty while mat4 holds one baked matrix per
-            // frame). Each frame's matrix must be decomposed back into T/R/S
-            // since aiNodeAnim has no raw-matrix key type. Unlike the SRT
-            // rotation path, PODReader writes these matrices as read from disk
-            // with no quaternion sign fix-up applied anywhere, so the decomposed
-            // quaternion is used as-is via RawToAiQuaternion (not ToAiQuaternion).
-            if (!kf.mat4.empty()) {
-                for (size_t k = 0; k < kf.mat4.size(); ++k) {
-                    glm::vec3 scale;
-                    glm::quat rotation;
-                    glm::vec3 translation;
-                    glm::vec3 skew;
-                    glm::vec4 perspective;
-                    if (!glm::decompose(kf.mat4[k], scale, rotation, translation, skew, perspective)) {
-                        continue;
+        bool warned = false;
+        for (uint32_t f = 0; f < framesToEvaluate; ++f) {
+            const PODLocalTransform local = EvaluateLocal(node, f, mConvention, warned);
+            // Key times are frame numbers; mTicksPerSecond carries the FPS.
+            const double time = static_cast<double>(f);
+            if (f < positionKeys) channel->mPositionKeys[f] = aiVectorKey(time, local.position);
+            if (f < scalingKeys) channel->mScalingKeys[f] = aiVectorKey(time, local.scaling);
+            if (f < rotationKeys) {
+                aiQuaternion q = local.rotation;
+                // Keep consecutive keys in the same hemisphere. Matrix
+                // decomposition picks an arbitrary sign per frame, and
+                // consumers that interpolate component-wise (rather than
+                // shortest-arc slerp) would otherwise spin through 360 deg.
+                if (f > 0) {
+                    const aiQuaternion &prev = channel->mRotationKeys[f - 1].mValue;
+                    if (prev.x * q.x + prev.y * q.y + prev.z * q.z + prev.w * q.w < 0.0f) {
+                        q = aiQuaternion(-q.w, -q.x, -q.y, -q.z);
                     }
-                    const double t = static_cast<double>(kf.timeInSeconds[k]) * fps;
-                    out.position.emplace_back(t, ToAiVector3D(translation));
-                    out.rotation.emplace_back(t, RawToAiQuaternion(rotation));
-                    out.scaling.emplace_back(t, ToAiVector3D(scale));
-                    maxTicks = std::max(maxTicks, t);
                 }
+                channel->mRotationKeys[f] = aiQuatKey(time, q);
             }
         }
+        if (warned) {
+            ASSIMP_LOG_WARN("POD: node \"", node.name, "\" has animation keys beyond its data; using its first key");
+        }
+        channels.push_back(channel);
     }
 
-    if (perNode.empty()) {
+    if (channels.empty()) {
         return;
     }
 
     aiAnimation *anim = new aiAnimation();
-    anim->mName = aiString(animInternal.animationName.empty() ? std::string("Take") : animInternal.animationName);
-    anim->mTicksPerSecond = fps;
-    anim->mDuration = maxTicks;
-
-    anim->mNumChannels = static_cast<unsigned int>(perNode.size());
-    anim->mChannels = new aiNodeAnim *[anim->mNumChannels];
-    unsigned int channelIdx = 0;
-    for (auto &entry : perNode) {
-        aiNodeAnim *nodeAnim = new aiNodeAnim();
-        nodeAnim->mNodeName = mNodesByIndex[entry.first]->mName;
-
-        Channels &c = entry.second;
-        nodeAnim->mNumPositionKeys = static_cast<unsigned int>(c.position.size());
-        if (nodeAnim->mNumPositionKeys) {
-            nodeAnim->mPositionKeys = new aiVectorKey[c.position.size()];
-            std::copy(c.position.begin(), c.position.end(), nodeAnim->mPositionKeys);
-        }
-        nodeAnim->mNumRotationKeys = static_cast<unsigned int>(c.rotation.size());
-        if (nodeAnim->mNumRotationKeys) {
-            nodeAnim->mRotationKeys = new aiQuatKey[c.rotation.size()];
-            std::copy(c.rotation.begin(), c.rotation.end(), nodeAnim->mRotationKeys);
-        }
-        nodeAnim->mNumScalingKeys = static_cast<unsigned int>(c.scaling.size());
-        if (nodeAnim->mNumScalingKeys) {
-            nodeAnim->mScalingKeys = new aiVectorKey[c.scaling.size()];
-            std::copy(c.scaling.begin(), c.scaling.end(), nodeAnim->mScalingKeys);
-        }
-
-        anim->mChannels[channelIdx++] = nodeAnim;
+    std::string animName;
+    if (!model.getInternalData().animationsData.empty()) {
+        animName = model.getInternalData().animationsData[0].getInternalData().animationName;
     }
+    anim->mName = aiString(animName.empty() ? std::string("Take") : animName);
+    anim->mTicksPerSecond = fps;
+    // The last key sits at frame numFrames - 1.
+    anim->mDuration = static_cast<double>(numFrames - 1);
+    anim->mNumChannels = static_cast<unsigned int>(channels.size());
+    anim->mChannels = new aiNodeAnim *[channels.size()];
+    std::copy(channels.begin(), channels.end(), anim->mChannels);
 
     pScene->mNumAnimations = 1;
     pScene->mAnimations = new aiAnimation *[1];
     pScene->mAnimations[0] = anim;
+}
+
+void PODImporter::SetupProperties(const Importer *pImp) {
+    mConventionSetting = pImp->GetPropertyInteger(AI_CONFIG_IMPORT_POD_QUATERNION_CONVENTION, -1);
 }
 
 void PODImporter::InternReadFile(const std::string &pFile, aiScene *pScene, IOSystem *pIOHandler) {
@@ -604,6 +826,15 @@ void PODImporter::InternReadFile(const std::string &pFile, aiScene *pScene, IOSy
         throw DeadlyImportError("POD: failed to read file ", pFile);
     }
 
+    const PODRawInfo raw = ScanRawPod({ buffer.data(), buffer.size() });
+    switch (mConventionSetting) {
+    case 0: mConvention = PODQuaternionConvention::Sdk; break;
+    case 1: mConvention = PODQuaternionConvention::Raw; break;
+    default: mConvention = DetectConvention(raw); break;
+    }
+    ASSIMP_LOG_INFO("POD: history \"", raw.history, "\"; using ",
+            mConvention == PODQuaternionConvention::Sdk ? "SDK (conjugate)" : "raw", " quaternion convention");
+
     pvr::BufferStream stream(pFile, buffer.data(), buffer.size());
 
     Model model;
@@ -613,9 +844,9 @@ void PODImporter::InternReadFile(const std::string &pFile, aiScene *pScene, IOSy
         throw DeadlyImportError("POD: failed to parse file ", pFile, ": ", e.what());
     }
 
-    BuildNodes(model, pScene);
+    BuildNodes(model, raw, pScene);
     BuildMeshesAndMaterials(model, pScene);
-    BuildAnimations(model, pScene);
+    BuildAnimations(model, raw, pScene);
 }
 
 } // namespace Assimp
