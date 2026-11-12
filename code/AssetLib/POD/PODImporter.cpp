@@ -744,12 +744,28 @@ void PODImporter::BuildAnimations(Model &model, const PODRawInfo &raw, aiScene *
         if (!HasTransformData(node)) continue;
 
         const bool isMatrix = !node.matrix.empty();
-        const auto keyCount = [&](uint32_t flag) -> uint32_t {
-            return (node.animFlags & flag) != 0 ? numFrames : 1;
+        // Number of keys to emit for one component: 1 if it isn't animated,
+        // else numFrames capped by what the file can actually supply -- one
+        // per index entry, or one per stride of key data. The scene frame
+        // count is an untrusted 32-bit value; without the cap, a tiny file
+        // declaring ~4 billion frames would force multi-gigabyte key arrays
+        // per node. Frames past the cap would only repeat the last key,
+        // which assimp consumers already hold past the final key.
+        const auto keyCount = [&](uint32_t flag, const std::vector<float> &data,
+                                      const std::vector<uint32_t> &indices, size_t stride) -> uint32_t {
+            if ((node.animFlags & flag) == 0) return 1;
+            const size_t available = indices.empty() ? data.size() / stride : indices.size();
+            return static_cast<uint32_t>(std::max<size_t>(1, std::min<size_t>(numFrames, available)));
         };
-        const uint32_t positionKeys = keyCount(isMatrix ? cPodHasMatrixAni : cPodHasPositionAni);
-        const uint32_t rotationKeys = keyCount(isMatrix ? cPodHasMatrixAni : cPodHasRotationAni);
-        const uint32_t scalingKeys = keyCount(isMatrix ? cPodHasMatrixAni : cPodHasScaleAni);
+        const uint32_t positionKeys = isMatrix ?
+                keyCount(cPodHasMatrixAni, node.matrix, node.matrixIdx, cPodMatrixStride) :
+                keyCount(cPodHasPositionAni, node.position, node.positionIdx, cPodPositionStride);
+        const uint32_t rotationKeys = isMatrix ?
+                positionKeys :
+                keyCount(cPodHasRotationAni, node.rotation, node.rotationIdx, cPodRotationStride);
+        const uint32_t scalingKeys = isMatrix ?
+                positionKeys :
+                keyCount(cPodHasScaleAni, node.scale, node.scaleIdx, cPodScaleStride);
         const uint32_t framesToEvaluate = std::max({ positionKeys, rotationKeys, scalingKeys });
 
         aiNodeAnim *channel = new aiNodeAnim();
